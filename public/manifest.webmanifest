@@ -1,0 +1,18 @@
+{
+  "name": "PDFStudio — Suite PDF Local",
+  "short_name": "PDFStudio",
+  "description": "Edita, convierte, comprime, combina y aplica OCR a tus PDFs 100% en tu dispositivo, sin subir archivos.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F6F8FC",
+  "theme_color": "#2563EB",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
