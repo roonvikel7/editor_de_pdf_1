@@ -225,7 +225,13 @@ export async function convertPdfToPptx(
             h: el.shapeType === 'line' && el.height < 0.005 ? 0 : h,
             fill:
               el.fillHex && el.shapeType !== 'line'
-                ? { color: el.fillHex }
+                ? {
+                    color: el.fillHex,
+                    transparency:
+                      typeof el.fillAlpha === 'number' && el.fillAlpha < 0.98
+                        ? Math.round((1 - el.fillAlpha) * 100)
+                        : undefined,
+                  }
                 : { type: 'none' },
             line:
               el.strokeHex && lineWidthPt > 0
