@@ -1,7 +1,76 @@
-import type { ProgressInfo } from '../types/pdf';
-import { destroyPdfDocument, extractPageTextBlocks, loadPdfDocument, renderPageToCanvas } from './pdfCore';
+import type { PDFPageProxy } from 'pdfjs-dist';
+import type { ExtractedTextBlock, ProgressInfo } from '../types/pdf';
+import {
+  destroyPdfDocument,
+  extractPageImages,
+  extractPageTextBlocks,
+  loadPdfDocument,
+  renderPageToCanvas,
+} from './pdfCore';
 
 export type ImageOutputFormat = 'png' | 'jpeg' | 'webp';
+
+/**
+ * Respaldo OCR automático para páginas escaneadas o sin texto vectorial.
+ * Devuelve bloques de texto editables con coordenadas normalizadas (0..1) para Word, PowerPoint y Excel.
+ */
+async function extractTextBlocksWithOcrFallback(
+  page: PDFPageProxy,
+  lang: string,
+  onStatus?: (msg: string) => void
+): Promise<ExtractedTextBlock[]> {
+  onStatus?.('Página sin texto seleccionable · aplicando OCR automático...');
+  const Tesseract = await import('tesseract.js');
+  const canvas = document.createElement('canvas');
+  const vp1 = page.getViewport({ scale: 1 });
+  await renderPageToCanvas(page, canvas, 2.0);
+
+  const worker = await Tesseract.createWorker(lang, 1, {
+    workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@7.0.0/dist/worker.min.js',
+    corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@7.0.0',
+    langPath: 'https://tessdata.projectnaptha.com/4.0.0_fast',
+  });
+
+  try {
+    const res = await worker.recognize(canvas, {}, { text: true, blocks: true });
+    const blocks: ExtractedTextBlock[] = [];
+    let idx = 0;
+
+    if (res.data.blocks) {
+      for (const block of res.data.blocks) {
+        for (const para of block.paragraphs) {
+          for (const line of para.lines) {
+            const text = (line.text || '').trim();
+            if (!text) continue;
+            const b = line.bbox;
+            const normX = Math.max(0, b.x0 / canvas.width);
+            const normY = Math.max(0, b.y0 / canvas.height);
+            const normW = Math.min(1 - normX, Math.max(0.02, (b.x1 - b.x0) / canvas.width));
+            const normH = Math.min(1 - normY, Math.max(0.015, (b.y1 - b.y0) / canvas.height));
+            const approxFontPt = Math.max(8, Math.min(48, Math.round(normH * vp1.height * 0.78)));
+
+            blocks.push({
+              id: `ocr-${idx++}`,
+              text,
+              x: normX,
+              y: normY,
+              width: normW,
+              height: normH,
+              fontSizePt: approxFontPt,
+              fontName: 'Helvetica',
+              bold: approxFontPt >= 16,
+              italic: false,
+              angleDeg: 0,
+            });
+          }
+        }
+      }
+    }
+    return blocks;
+  } finally {
+    await worker.terminate();
+  }
+}
 
 /**
  * PDF → Imágenes (PNG / JPG / WebP). Si tiene >1 página empaqueta en .zip localmente.
@@ -11,9 +80,9 @@ export async function convertPdfToImages(
   baseName: string,
   options: {
     format: ImageOutputFormat;
-    scale: number; // 1.5 = ~108 DPI, 2 = ~144 DPI, 3 = ~216 DPI
-    quality: number; // 0.6 - 0.96
-    pageIndices?: number[]; // 1-based; omit = todas
+    scale: number;
+    quality: number;
+    pageIndices?: number[];
   },
   onProgress?: (p: ProgressInfo) => void
 ): Promise<{ blob: Blob; filename: string; count: number }> {
@@ -85,18 +154,21 @@ export async function convertPdfToImages(
 }
 
 /**
- * PDF → Word (.docx) 100% en navegador.
- * Modo 'editable': extrae párrafos y encabezados reales por tamaño de fuente.
- * Modo 'visual': inserta cada página como imagen nítida de alta resolución (ideal para escaneos).
+ * PDF → Word (.docx) 100% EDITABLE por defecto.
+ * Extrae textos con jerarquía real (títulos, negrita, cursiva) e imágenes embebidas individuales en su orden vertical.
+ * Si una página no tiene texto vectorial (escaneo), usa OCR automático para generar párrafos editables y NO una foto fija.
  */
 export async function convertPdfToDocx(
   buffer: ArrayBuffer,
   baseName: string,
   mode: 'editable' | 'visual' = 'editable',
-  onProgress?: (p: ProgressInfo) => void
+  onProgress?: (p: ProgressInfo) => void,
+  options?: { autoOcr?: boolean; ocrLang?: string }
 ): Promise<{ blob: Blob; filename: string }> {
   const cleanName = baseName.replace(/\.pdf$/i, '');
-  onProgress?.({ percent: 10, message: 'Cargando motor de documentos Word...' });
+  const autoOcr = options?.autoOcr ?? true;
+  const ocrLang = options?.ocrLang ?? 'spa';
+  onProgress?.({ percent: 8, message: 'Cargando motor de documentos Word...' });
 
   const [pdf, docx] = await Promise.all([loadPdfDocument(buffer), import('docx')]);
   const { Document, Packer, Paragraph, TextRun, HeadingLevel, PageBreak, ImageRun } = docx;
@@ -105,9 +177,10 @@ export async function convertPdfToDocx(
 
   try {
     for (let p = 1; p <= pdf.numPages; p++) {
+      const pct = 12 + Math.round(((p - 0.5) / pdf.numPages) * 78);
       onProgress?.({
-        percent: 15 + Math.round((p / pdf.numPages) * 75),
-        message: `Procesando página ${p} de ${pdf.numPages}...`,
+        percent: pct,
+        message: `Extrayendo contenido editable de página ${p} de ${pdf.numPages}...`,
       });
 
       const page = await pdf.getPage(p);
@@ -122,7 +195,6 @@ export async function convertPdfToDocx(
         const vp = page.getViewport({ scale: 1 });
         const targetW = 600;
         const targetH = Math.round((vp.height / vp.width) * targetW);
-
         children.push(
           new Paragraph({
             children: [
@@ -135,55 +207,78 @@ export async function convertPdfToDocx(
           })
         );
       } else {
-        const blocks = await extractPageTextBlocks(page);
+        // Extraer textos + imágenes individuales en paralelo
+        let blocks = await extractPageTextBlocks(page);
+        const embeddedImages = await extractPageImages(page).catch(() => []);
 
-        if (blocks.length === 0) {
-          // Si la página parece escaneada sin texto, insertamos su captura para no perder contenido
-          const canvas = document.createElement('canvas');
-          await renderPageToCanvas(page, canvas, 1.5);
-          const pngBlob = await new Promise<Blob>((resolve, reject) =>
-            canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Error PNG'))), 'image/png')
+        if (blocks.length === 0 && autoOcr) {
+          blocks = await extractTextBlocksWithOcrFallback(page, ocrLang, (msg) =>
+            onProgress?.({ percent: pct, message: `Pág. ${p}: ${msg}` })
           );
-          const imgBytes = new Uint8Array(await pngBlob.arrayBuffer());
-          const vp = page.getViewport({ scale: 1 });
+        }
+
+        const sizes = blocks.map((b) => b.fontSizePt).sort((a, b) => a - b);
+        const medianSize = sizes[Math.floor(sizes.length / 2)] || 11;
+
+        // Intercalar párrafos editables e imágenes individuales en su orden vertical (Y)
+        type FlowItem =
+          | { kind: 'text'; y: number; x: number; block: ExtractedTextBlock }
+          | { kind: 'image'; y: number; x: number; img: (typeof embeddedImages)[number] };
+
+        const flow: FlowItem[] = [
+          ...blocks.map((block) => ({ kind: 'text' as const, y: block.y, x: block.x, block })),
+          ...embeddedImages.map((img) => ({ kind: 'image' as const, y: img.y, x: img.x, img })),
+        ].sort((a, b) => (Math.abs(a.y - b.y) > 0.015 ? a.y - b.y : a.x - b.x));
+
+        if (flow.length === 0) {
           children.push(
             new Paragraph({
-              children: [
-                new ImageRun({
-                  data: imgBytes,
-                  transformation: { width: 580, height: Math.round((vp.height / vp.width) * 580) },
-                  type: 'png',
-                }),
-              ],
+              children: [new TextRun({ text: `(Página ${p} sin texto detectable)`, italics: true })],
             })
           );
         } else {
-          // Calcular tamaño de fuente típico del cuerpo de texto para detectar títulos
-          const sizes = blocks.map((b) => b.fontSizePt).sort((a, b) => a - b);
-          const medianSize = sizes[Math.floor(sizes.length / 2)] || 11;
+          for (const item of flow) {
+            if (item.kind === 'image') {
+              const targetW = Math.min(540, Math.max(90, Math.round(item.img.width * 580)));
+              const ratio = item.img.pixelHeight / Math.max(1, item.img.pixelWidth);
+              const targetH = Math.min(680, Math.max(60, Math.round(targetW * ratio)));
+              children.push(
+                new Paragraph({
+                  spacing: { before: 100, after: 120 },
+                  children: [
+                    new ImageRun({
+                      data: item.img.pngBytes,
+                      transformation: { width: targetW, height: targetH },
+                      type: 'png',
+                    }),
+                  ],
+                })
+              );
+            } else {
+              const b = item.block;
+              const isH1 = b.fontSizePt >= medianSize * 1.45 && b.text.length < 140;
+              const isH2 = !isH1 && b.fontSizePt >= medianSize * 1.2 && b.text.length < 160;
+              const isBold = Boolean(b.bold) || isH1 || isH2;
 
-          for (const block of blocks) {
-            const isH1 = block.fontSizePt >= medianSize * 1.45 && block.text.length < 140;
-            const isH2 = !isH1 && block.fontSizePt >= medianSize * 1.2 && block.text.length < 160;
-            const isBold = /bold|black|heavy|demi/i.test(block.fontName) || isH1 || isH2;
-
-            children.push(
-              new Paragraph({
-                heading: isH1
-                  ? HeadingLevel.HEADING_1
-                  : isH2
-                    ? HeadingLevel.HEADING_2
-                    : undefined,
-                spacing: { after: isH1 || isH2 ? 160 : 90 },
-                children: [
-                  new TextRun({
-                    text: block.text,
-                    bold: isBold,
-                    size: Math.round(Math.max(16, Math.min(48, block.fontSizePt * 2))),
-                  }),
-                ],
-              })
-            );
+              children.push(
+                new Paragraph({
+                  heading: isH1
+                    ? HeadingLevel.HEADING_1
+                    : isH2
+                      ? HeadingLevel.HEADING_2
+                      : undefined,
+                  spacing: { after: isH1 || isH2 ? 150 : 85 },
+                  children: [
+                    new TextRun({
+                      text: b.text,
+                      bold: isBold,
+                      italics: Boolean(b.italic),
+                      size: Math.round(Math.max(16, Math.min(48, b.fontSizePt * 2))),
+                    }),
+                  ],
+                })
+              );
+            }
           }
         }
       }
@@ -193,14 +288,14 @@ export async function convertPdfToDocx(
       }
     }
 
-    onProgress?.({ percent: 94, message: 'Generando archivo .docx...' });
+    onProgress?.({ percent: 94, message: 'Generando documento Word editable (.docx)...' });
     const doc = new Document({
       creator: 'PDFStudio Local',
       title: cleanName,
       sections: [{ children }],
     });
     const blob = await Packer.toBlob(doc);
-    onProgress?.({ percent: 100, message: 'Documento Word listo' });
+    onProgress?.({ percent: 100, message: 'Documento Word editable listo' });
     return { blob, filename: `${cleanName}.docx` };
   } finally {
     await destroyPdfDocument(pdf);
@@ -208,15 +303,18 @@ export async function convertPdfToDocx(
 }
 
 /**
- * PDF → Excel (.xlsx) o CSV agrupando elementos por filas (Y) y columnas (X).
+ * PDF → Excel (.xlsx) o CSV agrupando elementos por filas (Y) y columnas (X), con respaldo OCR automático.
  */
 export async function convertPdfToExcel(
   buffer: ArrayBuffer,
   baseName: string,
   format: 'xlsx' | 'csv' = 'xlsx',
-  onProgress?: (p: ProgressInfo) => void
+  onProgress?: (p: ProgressInfo) => void,
+  options?: { autoOcr?: boolean; ocrLang?: string }
 ): Promise<{ blob: Blob; filename: string }> {
   const cleanName = baseName.replace(/\.pdf$/i, '');
+  const autoOcr = options?.autoOcr ?? true;
+  const ocrLang = options?.ocrLang ?? 'spa';
   onProgress?.({ percent: 10, message: 'Cargando motor de hojas de cálculo...' });
 
   const [pdf, XLSX] = await Promise.all([loadPdfDocument(buffer), import('xlsx')]);
@@ -225,9 +323,10 @@ export async function convertPdfToExcel(
 
   try {
     for (let p = 1; p <= pdf.numPages; p++) {
+      const pct = 15 + Math.round((p / pdf.numPages) * 75);
       onProgress?.({
-        percent: 15 + Math.round((p / pdf.numPages) * 75),
-        message: `Extrayendo tabla de página ${p} de ${pdf.numPages}...`,
+        percent: pct,
+        message: `Extrayendo tabla editable de página ${p} de ${pdf.numPages}...`,
       });
 
       const page = await pdf.getPage(p);
@@ -249,9 +348,23 @@ export async function convertPdfToExcel(
         items.push({ str: it.str.trim(), x, y, w: it.width || 10 });
       }
 
+      // Respaldo OCR automático si el PDF es escaneado
+      if (items.length === 0 && autoOcr) {
+        const ocrBlocks = await extractTextBlocksWithOcrFallback(page, ocrLang, (msg) =>
+          onProgress?.({ percent: pct, message: `Pág. ${p}: ${msg}` })
+        );
+        for (const b of ocrBlocks) {
+          items.push({
+            str: b.text,
+            x: b.x * viewport.width,
+            y: b.y * viewport.height,
+            w: b.width * viewport.width,
+          });
+        }
+      }
+
       items.sort((a, b) => (Math.abs(a.y - b.y) > 6 ? a.y - b.y : a.x - b.x));
 
-      // Agrupar por filas
       const rowGroups: CellItem[][] = [];
       for (const it of items) {
         const last = rowGroups[rowGroups.length - 1];
@@ -301,7 +414,7 @@ export async function convertPdfToExcel(
     const blob = new Blob([out], {
       type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     });
-    onProgress?.({ percent: 100, message: 'Excel listo' });
+    onProgress?.({ percent: 100, message: 'Excel editable listo' });
     return { blob, filename: `${cleanName}.xlsx` };
   } finally {
     await destroyPdfDocument(pdf);
@@ -309,77 +422,145 @@ export async function convertPdfToExcel(
 }
 
 /**
- * PDF → PowerPoint (.pptx).
+ * PDF → PowerPoint (.pptx) 100% EDITABLE por defecto.
+ * Separa cada imagen embebida y cada cuadro de texto con su posición, tamaño, estilo y rotación reales
+ * (incluyendo texto vertical) y usa OCR automático si la página es escaneada.
  */
 export async function convertPdfToPptx(
   buffer: ArrayBuffer,
   baseName: string,
-  mode: 'visual' | 'editable' = 'visual',
-  onProgress?: (p: ProgressInfo) => void
+  mode: 'editable' | 'visual' = 'editable',
+  onProgress?: (p: ProgressInfo) => void,
+  options?: { autoOcr?: boolean; ocrLang?: string }
 ): Promise<{ blob: Blob; filename: string }> {
   const cleanName = baseName.replace(/\.pdf$/i, '');
-  onProgress?.({ percent: 10, message: 'Cargando motor de presentaciones PowerPoint...' });
+  const autoOcr = options?.autoOcr ?? true;
+  const ocrLang = options?.ocrLang ?? 'spa';
+  onProgress?.({ percent: 8, message: 'Cargando motor de presentaciones PowerPoint...' });
 
   const [pdf, PptxMod] = await Promise.all([loadPdfDocument(buffer), import('pptxgenjs')]);
   const PptxGenJS = PptxMod.default;
   const pptx = new PptxGenJS();
   pptx.title = cleanName;
   pptx.author = 'PDFStudio Local';
-  pptx.layout = 'LAYOUT_WIDE'; // 13.333 x 7.5 pulgadas
 
   try {
+    // Ajustar el tamaño de diapositiva a la proporción real de la página 1 del PDF (sin recortar ni deformar)
+    const firstPage = await pdf.getPage(1);
+    const firstVp = firstPage.getViewport({ scale: 1 });
+    const aspect = firstVp.width / Math.max(1, firstVp.height);
+    let slideW = 13.333;
+    let slideH = 7.5;
+    if (aspect < 1) {
+      // PDF vertical (ej. A4 o Carta)
+      slideH = 10;
+      slideW = Math.max(5.5, Math.min(13.333, Math.round(slideH * aspect * 100) / 100));
+    } else {
+      slideW = 13.333;
+      slideH = Math.max(5, Math.min(10, Math.round((slideW / aspect) * 100) / 100));
+    }
+    pptx.defineLayout({ name: 'PDF_CUSTOM', width: slideW, height: slideH });
+    pptx.layout = 'PDF_CUSTOM';
+
     for (let p = 1; p <= pdf.numPages; p++) {
+      const pct = 14 + Math.round(((p - 0.5) / pdf.numPages) * 76);
       onProgress?.({
-        percent: 15 + Math.round((p / pdf.numPages) * 75),
-        message: `Creando diapositiva ${p} de ${pdf.numPages}...`,
+        percent: pct,
+        message: `Creando diapositiva editable ${p} de ${pdf.numPages}...`,
       });
 
       const page = await pdf.getPage(p);
+      const vp = page.getViewport({ scale: 1 });
       const slide = pptx.addSlide();
 
       if (mode === 'visual') {
         const canvas = document.createElement('canvas');
         await renderPageToCanvas(page, canvas, 1.8);
         const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
-        const vp = page.getViewport({ scale: 1 });
-        const slideW = 13.333;
-        const slideH = 7.5;
-        const aspect = vp.width / vp.height;
+        const pageAspect = vp.width / vp.height;
 
         let w = slideW;
-        let h = w / aspect;
+        let h = w / pageAspect;
         if (h > slideH) {
           h = slideH;
-          w = h * aspect;
+          w = h * pageAspect;
         }
-        const x = (slideW - w) / 2;
-        const y = (slideH - h) / 2;
-        slide.addImage({ data: dataUrl, x, y, w, h });
+        slide.addImage({
+          data: dataUrl,
+          x: (slideW - w) / 2,
+          y: (slideH - h) / 2,
+          w,
+          h,
+        });
       } else {
-        const blocks = await extractPageTextBlocks(page);
-        const slideW = 13.333;
-        const slideH = 7.5;
-        if (blocks.length === 0) {
-          slide.addText(`Página ${p} (sin texto extraíble)`, { x: 0.8, y: 1, w: 11, h: 1, fontSize: 18 });
+        // 1) Extraer e insertar cada imagen individual en su posición exacta (movible y editable en PPT)
+        const embeddedImages = await extractPageImages(page).catch(() => []);
+        for (const img of embeddedImages) {
+          slide.addImage({
+            data: img.dataUrl,
+            x: img.x * slideW,
+            y: img.y * slideH,
+            w: Math.max(0.25, img.width * slideW),
+            h: Math.max(0.25, img.height * slideH),
+          });
+        }
+
+        // 2) Extraer e insertar cada bloque de texto como cuadro de texto nativo editable
+        let blocks = await extractPageTextBlocks(page);
+        if (blocks.length === 0 && autoOcr) {
+          blocks = await extractTextBlocksWithOcrFallback(page, ocrLang, (msg) =>
+            onProgress?.({ percent: pct, message: `Diapositiva ${p}: ${msg}` })
+          );
+        }
+
+        // Escala de puntos PDF a puntos PowerPoint proporcional al tamaño de diapositiva
+        const ptScale = (slideW * 72) / Math.max(1, vp.width);
+
+        if (blocks.length === 0 && embeddedImages.length === 0) {
+          slide.addText(`Página ${p} (sin elementos de texto o imagen detectables)`, {
+            x: 0.6,
+            y: 0.8,
+            w: slideW - 1.2,
+            h: 0.8,
+            fontSize: 16,
+            color: '64748B',
+          });
         } else {
           for (const b of blocks) {
+            const isVertical = Math.abs(Math.abs(b.angleDeg || 0) - 90) < 18;
+            const scaledFont = Math.max(8, Math.min(54, Math.round(b.fontSizePt * ptScale * 0.92)));
+            const boxX = b.x * slideW;
+            const boxY = b.y * slideH;
+            const boxW = Math.max(0.5, Math.min(slideW - boxX, b.width * slideW + 0.35));
+            const boxH = Math.max(0.26, Math.min(slideH - boxY, b.height * slideH + 0.14));
+
             slide.addText(b.text, {
-              x: b.x * slideW,
-              y: b.y * slideH,
-              w: Math.max(0.8, Math.min(slideW - b.x * slideW, b.width * slideW + 0.4)),
-              h: Math.max(0.3, b.height * slideH + 0.1),
-              fontSize: Math.max(9, Math.min(36, Math.round(b.fontSizePt * 0.95))),
-              color: '1E293B',
+              x: boxX,
+              y: boxY,
+              w: isVertical ? Math.max(0.6, boxH) : boxW,
+              h: isVertical ? Math.max(0.35, boxW) : boxH,
+              fontSize: scaledFont,
+              bold: Boolean(b.bold),
+              italic: Boolean(b.italic),
+              color: '111827',
+              fontFace: /times|serif/i.test(b.fontName)
+                ? 'Times New Roman'
+                : /courier|mono/i.test(b.fontName)
+                  ? 'Courier New'
+                  : 'Arial',
+              margin: 0,
               valign: 'top',
+              fit: 'shrink',
+              rotate: b.angleDeg && b.angleDeg !== 0 ? Math.round(b.angleDeg) : undefined,
             });
           }
         }
       }
     }
 
-    onProgress?.({ percent: 94, message: 'Empaquetando .pptx...' });
+    onProgress?.({ percent: 94, message: 'Empaquetando presentación editable .pptx...' });
     const out = await pptx.write({ outputType: 'blob' });
-    onProgress?.({ percent: 100, message: 'PowerPoint listo' });
+    onProgress?.({ percent: 100, message: 'PowerPoint editable listo' });
     return { blob: out as Blob, filename: `${cleanName}.pptx` };
   } finally {
     await destroyPdfDocument(pdf);
@@ -387,26 +568,35 @@ export async function convertPdfToPptx(
 }
 
 /**
- * PDF → TXT o HTML limpio.
+ * PDF → TXT o HTML limpio (con respaldo OCR automático si es escaneado).
  */
 export async function convertPdfToTextOrHtml(
   buffer: ArrayBuffer,
   baseName: string,
   format: 'txt' | 'html',
-  onProgress?: (p: ProgressInfo) => void
+  onProgress?: (p: ProgressInfo) => void,
+  options?: { autoOcr?: boolean; ocrLang?: string }
 ): Promise<{ blob: Blob; filename: string; textPreview: string }> {
   const cleanName = baseName.replace(/\.pdf$/i, '');
+  const autoOcr = options?.autoOcr ?? true;
+  const ocrLang = options?.ocrLang ?? 'spa';
   const pdf = await loadPdfDocument(buffer);
   const pagesText: string[] = [];
 
   try {
     for (let p = 1; p <= pdf.numPages; p++) {
+      const pct = Math.round((p / pdf.numPages) * 90);
       onProgress?.({
-        percent: Math.round((p / pdf.numPages) * 90),
+        percent: pct,
         message: `Extrayendo texto de página ${p} de ${pdf.numPages}...`,
       });
       const page = await pdf.getPage(p);
-      const blocks = await extractPageTextBlocks(page);
+      let blocks = await extractPageTextBlocks(page);
+      if (blocks.length === 0 && autoOcr) {
+        blocks = await extractTextBlocksWithOcrFallback(page, ocrLang, (msg) =>
+          onProgress?.({ percent: pct, message: `Pág. ${p}: ${msg}` })
+        );
+      }
       pagesText.push(blocks.map((b) => b.text).join('\n'));
     }
 
@@ -474,7 +664,6 @@ export async function convertImagesToPdf(
     } else if (isJpg) {
       embedded = await doc.embedJpg(new Uint8Array(await file.arrayBuffer()));
     } else {
-      // Convertir WebP / BMP / GIF a PNG usando canvas local
       const bmp = await createImageBitmap(file);
       const canvas = document.createElement('canvas');
       canvas.width = bmp.width;

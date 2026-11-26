@@ -46,7 +46,9 @@ export const ConvertTool: React.FC<ConvertToolProps> = ({
   const [pdfFile, setPdfFile] = useState<{ name: string; buffer: ArrayBuffer; size: number } | null>(null);
   const [targetFormat, setTargetFormat] = useState<OutFormat>('docx');
   const [docxMode, setDocxMode] = useState<'editable' | 'visual'>('editable');
-  const [pptxMode, setPptxMode] = useState<'visual' | 'editable'>('visual');
+  const [pptxMode, setPptxMode] = useState<'editable' | 'visual'>('editable');
+  const [autoOcr, setAutoOcr] = useState(true);
+  const [ocrLang, setOcrLang] = useState('spa');
   const [imgScale, setImgScale] = useState(2);
 
   // Estado Otros -> PDF
@@ -89,12 +91,13 @@ export const ConvertTool: React.FC<ConvertToolProps> = ({
     setResultInfo(null);
     try {
       let res: { blob: Blob; filename: string; textPreview?: string };
+      const ocrOpts = { autoOcr, ocrLang };
       if (targetFormat === 'docx') {
-        res = await convertPdfToDocx(pdfFile.buffer, pdfFile.name, docxMode, setProgress);
+        res = await convertPdfToDocx(pdfFile.buffer, pdfFile.name, docxMode, setProgress, ocrOpts);
       } else if (targetFormat === 'xlsx' || targetFormat === 'csv') {
-        res = await convertPdfToExcel(pdfFile.buffer, pdfFile.name, targetFormat, setProgress);
+        res = await convertPdfToExcel(pdfFile.buffer, pdfFile.name, targetFormat, setProgress, ocrOpts);
       } else if (targetFormat === 'pptx') {
-        res = await convertPdfToPptx(pdfFile.buffer, pdfFile.name, pptxMode, setProgress);
+        res = await convertPdfToPptx(pdfFile.buffer, pdfFile.name, pptxMode, setProgress, ocrOpts);
       } else if (targetFormat === 'png' || targetFormat === 'jpeg' || targetFormat === 'webp') {
         res = await convertPdfToImages(
           pdfFile.buffer,
@@ -103,7 +106,7 @@ export const ConvertTool: React.FC<ConvertToolProps> = ({
           setProgress
         );
       } else {
-        res = await convertPdfToTextOrHtml(pdfFile.buffer, pdfFile.name, targetFormat, setProgress);
+        res = await convertPdfToTextOrHtml(pdfFile.buffer, pdfFile.name, targetFormat, setProgress, ocrOpts);
       }
 
       setResultInfo(res);
@@ -332,19 +335,9 @@ export const ConvertTool: React.FC<ConvertToolProps> = ({
               {targetFormat === 'pptx' && (
                 <div className="mt-4 rounded-xl bg-slate-50 p-3 dark:bg-slate-800/60">
                   <p className="mb-2 text-xs font-semibold text-slate-700 dark:text-slate-200">
-                    Modo de diapositivas:
+                    Modo de diapositivas PowerPoint:
                   </p>
                   <div className="flex flex-wrap gap-2">
-                    <button
-                      onClick={() => setPptxMode('visual')}
-                      className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${
-                        pptxMode === 'visual'
-                          ? 'bg-blue-600 text-white'
-                          : 'bg-white text-slate-600 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300'
-                      }`}
-                    >
-                      Diseño fiel (diapositiva nítida)
-                    </button>
                     <button
                       onClick={() => setPptxMode('editable')}
                       className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${
@@ -353,9 +346,49 @@ export const ConvertTool: React.FC<ConvertToolProps> = ({
                           : 'bg-white text-slate-600 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300'
                       }`}
                     >
-                      Cuadros de texto editables
+                      100% Editable (textos e imágenes separados · Recomendado)
+                    </button>
+                    <button
+                      onClick={() => setPptxMode('visual')}
+                      className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${
+                        pptxMode === 'visual'
+                          ? 'bg-blue-600 text-white'
+                          : 'bg-white text-slate-600 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300'
+                      }`}
+                    >
+                      Solo imagen fija (fidelidad visual)
                     </button>
                   </div>
+                </div>
+              )}
+
+              {(targetFormat === 'docx' ||
+                targetFormat === 'pptx' ||
+                targetFormat === 'xlsx' ||
+                targetFormat === 'csv' ||
+                targetFormat === 'html' ||
+                targetFormat === 'txt') && (
+                <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-blue-100 bg-blue-50/50 px-3 py-2.5 text-xs dark:border-blue-900/40 dark:bg-blue-950/25">
+                  <label className="flex cursor-pointer items-center gap-2 font-medium text-slate-700 dark:text-slate-200">
+                    <input
+                      type="checkbox"
+                      checked={autoOcr}
+                      onChange={(e) => setAutoOcr(e.target.checked)}
+                      className="accent-blue-600"
+                    />
+                    <span>OCR automático si el PDF es escaneado (siempre texto editable)</span>
+                  </label>
+                  {autoOcr && (
+                    <select
+                      value={ocrLang}
+                      onChange={(e) => setOcrLang(e.target.value)}
+                      className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs font-semibold dark:border-slate-700 dark:bg-slate-900"
+                    >
+                      <option value="spa">Español</option>
+                      <option value="spa+eng">Español + Inglés</option>
+                      <option value="eng">Inglés</option>
+                    </select>
+                  )}
                 </div>
               )}
 

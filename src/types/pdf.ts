@@ -104,6 +104,22 @@ export interface ExtractedTextBlock {
   height: number;
   fontSizePt: number;
   fontName: string;
+  bold?: boolean;
+  italic?: boolean;
+  angleDeg?: number; // 0 = horizontal, -90 / 90 = texto vertical
+}
+
+export interface ExtractedImageElement {
+  id: string;
+  dataUrl: string;
+  pngBytes: Uint8Array;
+  // Coordenadas normalizadas (0..1) en viewport sin zoom (top-left origin)
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  pixelWidth: number;
+  pixelHeight: number;
 }
 
 export interface WatermarkConfig {

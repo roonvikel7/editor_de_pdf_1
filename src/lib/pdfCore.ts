@@ -1,5 +1,5 @@
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist';
-import type { ExtractedTextBlock } from '../types/pdf';
+import type { ExtractedImageElement, ExtractedTextBlock } from '../types/pdf';
 
 type PdfJsModule = typeof import('pdfjs-dist');
 
@@ -145,6 +145,7 @@ export async function extractPageTextBlocks(
     height: number;
     fontSize: number;
     fontName: string;
+    angleDeg: number;
   }
 
   const rawItems: RawItem[] = [];
@@ -156,18 +157,28 @@ export async function extractPageTextBlocks(
     // Transformar coordenadas del espacio PDF al espacio del viewport (top-left)
     const tx = pdfjs.Util.transform(viewport.transform, item.transform);
     const fontHeight = Math.hypot(tx[2], tx[3]) || Math.hypot(tx[0], tx[1]) || 12;
-    const x = tx[4];
-    const yTop = tx[5] - fontHeight * 0.85;
-    const width = Math.max(item.width * (viewport.scale || 1), fontHeight * 0.5);
+    const angleRad = Math.atan2(tx[1], tx[0]);
+    let angleDeg = Math.round((angleRad * 180) / Math.PI);
+    // Normalizar pequeños ángulos cercanos a 0
+    if (Math.abs(angleDeg) < 6) angleDeg = 0;
+
+    const isVertical = Math.abs(Math.abs(angleDeg) - 90) < 18;
+    const rawW = Math.max(item.width * (viewport.scale || 1), fontHeight * 0.5);
+
+    const x = isVertical ? tx[4] - fontHeight * 0.5 : tx[4];
+    const yTop = isVertical ? tx[5] - rawW : tx[5] - fontHeight * 0.85;
+    const width = isVertical ? fontHeight * 1.25 : rawW;
+    const height = isVertical ? Math.max(rawW, fontHeight) : fontHeight * 1.18;
 
     rawItems.push({
       str,
       x,
       y: yTop,
       width,
-      height: fontHeight * 1.15,
+      height,
       fontSize: Math.max(6, Math.round(fontHeight * 10) / 10),
       fontName: item.fontName || 'Helvetica',
+      angleDeg,
     });
   }
 
@@ -180,7 +191,7 @@ export async function extractPageTextBlocks(
     return a.x - b.x;
   });
 
-  // Agrupar elementos contiguos de la misma línea en bloques cómodos de editar
+  // Agrupar elementos contiguos de la misma línea y misma orientación (sin mezclar columnas lejanas)
   const lines: RawItem[][] = [];
   for (const item of rawItems) {
     const lastLine = lines[lines.length - 1];
@@ -189,9 +200,17 @@ export async function extractPageTextBlocks(
       continue;
     }
     const prev = lastLine[lastLine.length - 1];
-    const sameRow = Math.abs(item.y - prev.y) <= Math.max(item.height, prev.height) * 0.5;
+    const sameAngle = Math.abs(item.angleDeg - prev.angleDeg) < 10;
+    const isVert = Math.abs(Math.abs(item.angleDeg) - 90) < 18;
+
+    if (!sameAngle || isVert) {
+      lines.push([item]);
+      continue;
+    }
+
+    const sameRow = Math.abs(item.y - prev.y) <= Math.max(item.height, prev.height) * 0.48;
     const gap = item.x - (prev.x + prev.width);
-    const closeHorizontally = gap < Math.max(item.fontSize * 3.5, 28) && gap > -item.fontSize * 1.5;
+    const closeHorizontally = gap < Math.max(item.fontSize * 2.2, 20) && gap > -item.fontSize * 1.2;
 
     if (sameRow && closeHorizontally) {
       lastLine.push(item);
@@ -220,20 +239,212 @@ export async function extractPageTextBlocks(
       text += cur.str;
     }
 
-    const avgFontSize =
-      group.reduce((s, g) => s + g.fontSize, 0) / group.length;
+    const avgFontSize = group.reduce((s, g) => s + g.fontSize, 0) / group.length;
+    const fontName = group[0].fontName;
 
     return {
       id: `tb-${idx}-${Math.round(minX)}-${Math.round(minY)}`,
       text: text.trim(),
-      x: Math.max(0, minX / viewport.width),
-      y: Math.max(0, minY / viewport.height),
+      x: Math.max(0, Math.min(0.98, minX / viewport.width)),
+      y: Math.max(0, Math.min(0.98, minY / viewport.height)),
       width: Math.min(1, Math.max(0.02, (maxX - minX) / viewport.width)),
       height: Math.min(1, Math.max(0.014, (maxY - minY) / viewport.height)),
       fontSizePt: Math.max(7, Math.min(72, Math.round(avgFontSize))),
-      fontName: group[0].fontName,
+      fontName,
+      bold: /bold|black|heavy|demi|medi/i.test(fontName),
+      italic: /italic|oblique/i.test(fontName),
+      angleDeg: group[0].angleDeg,
     };
   });
+}
+
+function multiplyMatrices(m1: number[], m2: number[]): number[] {
+  return [
+    m1[0] * m2[0] + m1[2] * m2[1],
+    m1[1] * m2[0] + m1[3] * m2[1],
+    m1[0] * m2[2] + m1[2] * m2[3],
+    m1[1] * m2[2] + m1[3] * m2[3],
+    m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
+    m1[1] * m2[4] + m1[3] * m2[5] + m1[5],
+  ];
+}
+
+function resolvePdfObject(page: PDFPageProxy, name: string): Promise<unknown> {
+  return new Promise((resolve) => {
+    const done = (val: unknown) => resolve(val);
+    try {
+      if (name.startsWith('g_')) {
+        if (page.commonObjs.has(name)) {
+          done(page.commonObjs.get(name));
+          return;
+        }
+        page.commonObjs.get(name, done);
+      } else {
+        if (page.objs.has(name)) {
+          done(page.objs.get(name));
+          return;
+        }
+        page.objs.get(name, done);
+      }
+      setTimeout(() => done(null), 1200);
+    } catch {
+      done(null);
+    }
+  });
+}
+
+async function pdfImageObjToPng(
+  imgObj: unknown
+): Promise<{ dataUrl: string; pngBytes: Uint8Array; pixelWidth: number; pixelHeight: number } | null> {
+  if (!imgObj || typeof imgObj !== 'object') return null;
+  const obj = imgObj as {
+    width?: number;
+    height?: number;
+    bitmap?: ImageBitmap;
+    data?: Uint8ClampedArray | Uint8Array;
+    kind?: number;
+  };
+
+  const w = obj.bitmap?.width || obj.width || 0;
+  const h = obj.bitmap?.height || obj.height || 0;
+  if (w < 16 || h < 16) return null;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  if (obj.bitmap) {
+    ctx.drawImage(obj.bitmap, 0, 0, w, h);
+  } else if (obj.data) {
+    const imgData = ctx.createImageData(w, h);
+    const dst = imgData.data;
+    const src = obj.data;
+    const totalPixels = w * h;
+
+    if (src.length === totalPixels * 4) {
+      dst.set(src);
+    } else if (src.length === totalPixels * 3) {
+      for (let i = 0, j = 0; i < src.length; i += 3, j += 4) {
+        dst[j] = src[i];
+        dst[j + 1] = src[i + 1];
+        dst[j + 2] = src[i + 2];
+        dst[j + 3] = 255;
+      }
+    } else if (src.length === totalPixels) {
+      for (let i = 0, j = 0; i < src.length; i++, j += 4) {
+        dst[j] = src[i];
+        dst[j + 1] = src[i];
+        dst[j + 2] = src[i];
+        dst[j + 3] = 255;
+      }
+    } else {
+      return null;
+    }
+    ctx.putImageData(imgData, 0, 0);
+  } else {
+    return null;
+  }
+
+  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
+  if (!blob) return null;
+  const pngBytes = new Uint8Array(await blob.arrayBuffer());
+  const dataUrl = canvas.toDataURL('image/png');
+  return { dataUrl, pngBytes, pixelWidth: w, pixelHeight: h };
+}
+
+/**
+ * Extrae las imágenes embebidas individuales de una página PDF junto con su posición y tamaño exactos.
+ * Permite que PowerPoint (.pptx) y Word (.docx) mantengan cada foto/gráfico como un objeto movible y editable.
+ */
+export async function extractPageImages(page: PDFPageProxy): Promise<ExtractedImageElement[]> {
+  const pdfjs = await getPdfJs();
+  const OPS = pdfjs.OPS;
+  const viewport = page.getViewport({ scale: 1 });
+
+  // Pre-render ligero (0.15x) para asegurar que el worker de PDF.js decodifique y popule todos los objetos de imagen en page.objs
+  try {
+    const tinyVp = page.getViewport({ scale: 0.15 });
+    const tinyCanvas = document.createElement('canvas');
+    tinyCanvas.width = Math.max(1, Math.floor(tinyVp.width));
+    tinyCanvas.height = Math.max(1, Math.floor(tinyVp.height));
+    const tinyCtx = tinyCanvas.getContext('2d');
+    if (tinyCtx) {
+      await page.render({ canvasContext: tinyCtx, canvas: tinyCanvas, viewport: tinyVp }).promise;
+    }
+  } catch {
+    // Continuar de todos modos con getOperatorList
+  }
+
+  const opList = await page.getOperatorList();
+
+  // Forzar carga de recursos renderizando a un canvas pequeño en memoria solo si los objetos aún no están decodificados
+  const images: ExtractedImageElement[] = [];
+  const stack: number[][] = [];
+  let ctm: number[] = [...viewport.transform];
+
+  for (let i = 0; i < opList.fnArray.length; i++) {
+    const fn = opList.fnArray[i];
+    const args = opList.argsArray[i];
+
+    if (fn === OPS.save) {
+      stack.push([...ctm]);
+    } else if (fn === OPS.restore) {
+      ctm = stack.pop() || [...viewport.transform];
+    } else if (fn === OPS.transform && Array.isArray(args) && args.length >= 6) {
+      ctm = multiplyMatrices(ctm, args as number[]);
+    } else if (
+      fn === OPS.paintImageXObject ||
+      fn === OPS.paintImageXObjectRepeat ||
+      fn === OPS.paintInlineImageXObject
+    ) {
+      let imgObj: unknown = null;
+      if (fn === OPS.paintInlineImageXObject) {
+        imgObj = args?.[0];
+      } else if (typeof args?.[0] === 'string') {
+        imgObj = await resolvePdfObject(page, args[0]);
+      }
+
+      const converted = await pdfImageObjToPng(imgObj);
+      if (!converted) continue;
+
+      // En PDF las imágenes se dibujan en el cuadrado unitario (0,0)-(1,1) transformado por el CTM actual
+      const corners = [
+        [ctm[4], ctm[5]],
+        [ctm[0] + ctm[4], ctm[1] + ctm[5]],
+        [ctm[2] + ctm[4], ctm[3] + ctm[5]],
+        [ctm[0] + ctm[2] + ctm[4], ctm[1] + ctm[3] + ctm[5]],
+      ];
+      const minX = Math.min(...corners.map((c) => c[0]));
+      const maxX = Math.max(...corners.map((c) => c[0]));
+      const minY = Math.min(...corners.map((c) => c[1]));
+      const maxY = Math.max(...corners.map((c) => c[1]));
+
+      const normX = Math.max(0, Math.min(0.99, minX / viewport.width));
+      const normY = Math.max(0, Math.min(0.99, minY / viewport.height));
+      const normW = Math.min(1 - normX, Math.max(0.01, (maxX - minX) / viewport.width));
+      const normH = Math.min(1 - normY, Math.max(0.01, (maxY - minY) / viewport.height));
+
+      // Ignorar imágenes minúsculas (< 2% de página) o fondos de página completa escaneada (> 94% de ambos lados)
+      if (normW < 0.02 || normH < 0.02) continue;
+      if (normW > 0.94 && normH > 0.94) continue;
+
+      images.push({
+        id: `img-${i}-${Math.round(minX)}-${Math.round(minY)}`,
+        dataUrl: converted.dataUrl,
+        pngBytes: converted.pngBytes,
+        x: normX,
+        y: normY,
+        width: normW,
+        height: normH,
+        pixelWidth: converted.pixelWidth,
+        pixelHeight: converted.pixelHeight,
+      });
+    }
+  }
+
+  return images;
 }
 
 /**
