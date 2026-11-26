@@ -721,6 +721,140 @@ function groupLinesIntoParagraphs(lines: RichTextLine[]): RichTextParagraph[] {
 }
 
 /**
+ * Encuentra islas independientes (componentes conectados) de píxeles no transparentes en un canvas residual.
+ * Garantiza que ningún adorno, escudo, foto o forma que haya escapado a la clasificación por operador se pierda,
+ * recortando cada elemento faltante como su propio objeto independiente (nunca una imagen gigante de toda la página).
+ */
+function findResidualIslands(
+  canvas: HTMLCanvasElement
+): Array<{ x: number; y: number; w: number; h: number }> {
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return [];
+
+  const { width, height } = canvas;
+  const data = ctx.getImageData(0, 0, width, height).data;
+
+  // Muestrear sobre una rejilla rápida (~180 celdas en el lado largo) para agrupar micro-píxeles cercanos del mismo objeto
+  const gw = Math.min(180, Math.max(40, Math.round(width / 10)));
+  const gh = Math.min(140, Math.max(30, Math.round(height / 10)));
+  const cellW = width / gw;
+  const cellH = height / gh;
+
+  const grid = new Uint8Array(gw * gh);
+  let anyOccupied = false;
+
+  for (let gy = 0; gy < gh; gy++) {
+    const yStart = Math.floor(gy * cellH);
+    const yEnd = Math.min(height, Math.ceil((gy + 1) * cellH));
+    for (let gx = 0; gx < gw; gx++) {
+      const xStart = Math.floor(gx * cellW);
+      const xEnd = Math.min(width, Math.ceil((gx + 1) * cellW));
+      let found = false;
+      const stepY = Math.max(1, Math.floor((yEnd - yStart) / 4));
+      const stepX = Math.max(1, Math.floor((xEnd - xStart) / 4));
+      for (let y = yStart; y < yEnd && !found; y += stepY) {
+        const rowOff = y * width * 4;
+        for (let x = xStart; x < xEnd; x += stepX) {
+          if (data[rowOff + x * 4 + 3] > 12) {
+            found = true;
+            break;
+          }
+        }
+      }
+      if (found) {
+        grid[gy * gw + gx] = 1;
+        anyOccupied = true;
+      }
+    }
+  }
+
+  if (!anyOccupied) return [];
+
+  // BFS de componentes conectados con vecindad 8-conectada (distancia 1 celda)
+  const visited = new Uint8Array(gw * gh);
+  const queue = new Int32Array(gw * gh);
+  const islands: Array<{ x: number; y: number; w: number; h: number }> = [];
+
+  for (let gy = 0; gy < gh; gy++) {
+    for (let gx = 0; gx < gw; gx++) {
+      const start = gy * gw + gx;
+      if (!grid[start] || visited[start]) continue;
+
+      let head = 0;
+      let tail = 0;
+      visited[start] = 1;
+      queue[tail++] = start;
+
+      let minGx = gx;
+      let maxGx = gx;
+      let minGy = gy;
+      let maxGy = gy;
+
+      while (head < tail) {
+        const cur = queue[head++];
+        const cx = cur % gw;
+        const cy = (cur - cx) / gw;
+        if (cx < minGx) minGx = cx;
+        if (cx > maxGx) maxGx = cx;
+        if (cy < minGy) minGy = cy;
+        if (cy > maxGy) maxGy = cy;
+
+        for (let dy = -1; dy <= 1; dy++) {
+          const ny = cy + dy;
+          if (ny < 0 || ny >= gh) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = cx + dx;
+            if (nx < 0 || nx >= gw) continue;
+            const nIdx = ny * gw + nx;
+            if (grid[nIdx] && !visited[nIdx]) {
+              visited[nIdx] = 1;
+              queue[tail++] = nIdx;
+            }
+          }
+        }
+      }
+
+      // Refinar el bounding box de la isla al píxel exacto en `canvas`
+      const rx0 = Math.max(0, Math.floor(minGx * cellW) - 2);
+      const ry0 = Math.max(0, Math.floor(minGy * cellH) - 2);
+      const rx1 = Math.min(width - 1, Math.ceil((maxGx + 1) * cellW) + 2);
+      const ry1 = Math.min(height - 1, Math.ceil((maxGy + 1) * cellH) + 2);
+
+      let pMinX = rx1;
+      let pMaxX = rx0;
+      let pMinY = ry1;
+      let pMaxY = ry0;
+      let pxCount = 0;
+
+      for (let y = ry0; y <= ry1; y++) {
+        const rowOff = y * width * 4;
+        for (let x = rx0; x <= rx1; x++) {
+          if (data[rowOff + x * 4 + 3] > 8) {
+            pxCount++;
+            if (x < pMinX) pMinX = x;
+            if (x > pMaxX) pMaxX = x;
+            if (y < pMinY) pMinY = y;
+            if (y > pMaxY) pMaxY = y;
+          }
+        }
+      }
+
+      if (pxCount >= 8 && pMaxX >= pMinX && pMaxY >= pMinY) {
+        islands.push({
+          x: pMinX,
+          y: pMinY,
+          w: pMaxX - pMinX + 1,
+          h: pMaxY - pMinY + 1,
+        });
+      }
+    }
+  }
+
+  return islands;
+}
+
+/**
  * Descompositor profesional de objetos PDF verificado pixel-a-pixel contra el render real de PDF.js:
  * - Ignora los rectángulos internos de `SMask` / transparencia (nunca genera cajas negras fantasma).
  * - Verifica CADA forma nativa (`rect`, `roundRect`, `ellipse`, `line`) directamente contra su render aislado
@@ -797,7 +931,7 @@ export async function analyzePdfPage(
   const fullCtx = fullCanvas.getContext('2d', { willReadFrequently: true });
   const noTextCtx = noTextCanvas.getContext('2d', { willReadFrequently: true });
 
-  // 2) Marcar operaciones internas de SMask (sombras/máscaras de opacidad) para NO extraerlas como formas opacas
+  // 2) Marcar SOLO definiciones internas reales de SMask (`grp.smask`), NUNCA grupos normales ni `isGray`
   const opCount = opList.fnArray.length;
   const isSMaskOp = new Uint8Array(opCount);
   const groupStack: boolean[] = [];
@@ -807,8 +941,8 @@ export async function analyzePdfPage(
     const fn = opList.fnArray[i];
     const args = opList.argsArray[i] as unknown[] | undefined;
     if (fn === OPS.beginGroup) {
-      const grp = args?.[0] as { smask?: unknown; isGray?: boolean } | undefined;
-      const startsSMask = Boolean(grp && (grp.smask || grp.isGray));
+      const grp = args?.[0] as { smask?: unknown } | undefined;
+      const startsSMask = Boolean(grp && grp.smask);
       groupStack.push(startsSMask);
       if (startsSMask) smaskDepth++;
     }
@@ -863,9 +997,15 @@ export async function analyzePdfPage(
     // No extraer definiciones internas de SMask como objetos sueltos
     if (isSMaskOp[i]) continue;
 
-    if (IMAGE_DRAW_OPS.has(fn)) {
+    if (
+      IMAGE_DRAW_OPS.has(fn) ||
+      fn === OPS.paintImageMaskXObject ||
+      fn === OPS.paintImageMaskXObjectGroup ||
+      fn === OPS.paintImageMaskXObjectRepeat ||
+      fn === OPS.paintSolidColorImageMask
+    ) {
       imageOpIndices.push(i);
-    } else if (fn === OPS.shadingFill) {
+    } else if (fn === OPS.shadingFill || fn === OPS.rawFillPath) {
       vectorOps.push({
         opIdx: i,
         x: 0,
@@ -991,6 +1131,7 @@ export async function analyzePdfPage(
 
   // 4) Procesar formas geométricas candidatas VERIFICANDO SIEMPRE su color/visibilidad reales desde PDF.js!
   const elements: SceneGraphicElement[] = [];
+  const consumedOpIndices = new Set<number>();
   let pageBackgroundHex = 'FFFFFF';
   let foundPageBg = false;
   const customVectorOps: VectorOpRecord[] = [];
@@ -1007,7 +1148,10 @@ export async function analyzePdfPage(
     // Renderizar SOLO esta forma en PDF.js para conocer su visibilidad, bbox, color y opacidad 100% REALES
     const isolated = await renderOpsIsolated(new Set([v.opIdx]), 1.5);
     const info = analyzeIsolatedCanvas(isolated);
-    if (!info) continue; // Forma invisible (ca=0 o recortada por clip) → descartada!
+    if (!info) {
+      consumedOpIndices.add(v.opIdx);
+      continue;
+    }
 
     const normX = info.bbox.x / isolated.width;
     const normY = info.bbox.y / isolated.height;
@@ -1026,6 +1170,7 @@ export async function analyzePdfPage(
     ) {
       pageBackgroundHex = info.dominantHex;
       foundPageBg = true;
+      consumedOpIndices.add(v.opIdx);
       continue;
     }
 
@@ -1049,13 +1194,16 @@ export async function analyzePdfPage(
         lineFlipH: v.lineFlipH,
         lineFlipV: v.lineFlipV,
       });
+      consumedOpIndices.add(v.opIdx);
     } else {
-      // Tiene borde + relleno de distinto color, degradado o sombra → exportar como objeto transparente fiel!
       const hiRes = await renderOpsIsolated(new Set([v.opIdx]), renderScale);
       const hiInfo = analyzeIsolatedCanvas(hiRes);
       if (hiInfo) {
         const g = await canvasBboxToGraphic(hiRes, hiInfo.bbox, v.opIdx, `shp-g-${pageNumber}-${v.opIdx}`);
-        if (g) elements.push(g);
+        if (g) {
+          elements.push(g);
+          consumedOpIndices.add(v.opIdx);
+        }
       }
     }
   }
@@ -1079,20 +1227,23 @@ export async function analyzePdfPage(
     const normH = info.bbox.h / isolated.height;
     if (normW < 0.01 && normH < 0.01) continue;
 
-    // Si es un fondo sólido completo pintado por un path complejo
     if (!foundPageBg && info.isUniformSolid && info.hasInteriorFill && info.avgAlpha > 0.9 && normW >= 0.94 && normH >= 0.94) {
       pageBackgroundHex = info.dominantHex;
       foundPageBg = true;
+      group.forEach((g) => consumedOpIndices.add(g.opIdx));
       continue;
     }
 
     const graphic = await canvasBboxToGraphic(isolated, info.bbox, group[0].opIdx, `vec-${pageNumber}-${c}`);
-    if (graphic) elements.push(graphic);
+    if (graphic) {
+      elements.push(graphic);
+      group.forEach((g) => consumedOpIndices.add(g.opIdx));
+    }
   }
 
   // 6) Procesar imágenes raster individuales (escudo, San Francisco, fotos de ejercicios, fotos circulares)
   let fullPageRasterImageOpIdx: number | null = null;
-  const maxImages = 20;
+  const maxImages = 24;
   for (let k = 0; k < Math.min(imageOpIndices.length, maxImages); k++) {
     const targetIdx = imageOpIndices[k];
     const isolated = await renderOpsIsolated(new Set([targetIdx]), renderScale);
@@ -1105,10 +1256,53 @@ export async function analyzePdfPage(
 
     if (normW > 0.92 && normH > 0.92) {
       fullPageRasterImageOpIdx = targetIdx;
+      consumedOpIndices.add(targetIdx);
       continue;
     }
 
     const graphic = await canvasBboxToGraphic(isolated, info.bbox, targetIdx, `img-${pageNumber}-${k}`);
+    if (graphic) {
+      elements.push(graphic);
+      consumedOpIndices.add(targetIdx);
+    }
+  }
+
+  // 6B) RED DE SEGURIDAD 100% COBERTURA: recuperar por islas conectadas cualquier elemento visual que no haya salido arriba
+  const residualCanvas = await renderPageFiltered(page, renderScale, {
+    transparent: true,
+    operationsFilter: (i, list) => {
+      if (isSMaskOp[i]) return true;
+      const fn = list.fnArray[i];
+      if (TEXT_DRAW_OPS.has(fn)) return false;
+      if (consumedOpIndices.has(i)) return false;
+      return true;
+    },
+  });
+
+  const residualIslands = findResidualIslands(residualCanvas);
+  for (let r = 0; r < residualIslands.length; r++) {
+    const island = residualIslands[r];
+    const normW = island.w / residualCanvas.width;
+    const normH = island.h / residualCanvas.height;
+    if (normW < 0.015 && normH < 0.015) continue;
+    // Si es una gran foto de página completa (escaneo), ya la maneja `scannedFallbackBg`
+    if (normW > 0.94 && normH > 0.94 && fullPageRasterImageOpIdx !== null) continue;
+
+    // Si es un rectángulo de página completa del mismo color que el fondo nativo, no duplicar
+    if (normW > 0.94 && normH > 0.94) {
+      const resInfo = analyzeIsolatedCanvas(residualCanvas);
+      if (resInfo && resInfo.isUniformSolid && resInfo.dominantHex === pageBackgroundHex) continue;
+    }
+
+    // Si es una tarjeta/marco grande (> 70% de ambos lados), va al fondo (zOrder bajo) para no tapar fotos ni adornos
+    const isLargeBackdrop = normW > 0.7 && normH > 0.7;
+    const zOrder = isLargeBackdrop ? -1 : opCount + r;
+    const graphic = await canvasBboxToGraphic(
+      residualCanvas,
+      island,
+      zOrder,
+      `res-${pageNumber}-${r}`
+    );
     if (graphic) elements.push(graphic);
   }
 
