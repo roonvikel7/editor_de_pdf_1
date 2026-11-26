@@ -1,8 +1,65 @@
 import type { ProgressInfo } from '../types/pdf';
 import { destroyPdfDocument, loadPdfDocument, renderPageToCanvas } from './pdfCore';
-import { analyzePdfPage } from './pdfSceneAnalyzer';
+import { analyzePdfPage, type SceneGraphicElement } from './pdfSceneAnalyzer';
 
 export type ImageOutputFormat = 'png' | 'jpeg' | 'webp';
+
+/**
+ * Helper: renderiza una forma nativa (`rect`, `roundRect`, `ellipse`, `line`) a un PNG transparente
+ * de su tamaño exacto para Word (`.docx`) donde `docx` no tiene autoformas nativas dibujadas con stroke/radius.
+ */
+async function renderShapeElementToPng(
+  el: Extract<SceneGraphicElement, { kind: 'shape' }>,
+  pageWidthPt: number,
+  pageHeightPt: number
+): Promise<{ pngBytes: Uint8Array; widthPx: number; heightPx: number } | null> {
+  const scale = 2;
+  const wPx = Math.max(6, Math.round(el.width * pageWidthPt * scale));
+  const hPx = Math.max(6, Math.round(el.height * pageHeightPt * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = wPx;
+  canvas.height = hPx;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  const lw = (el.strokeWidthPt || 0) * scale;
+  const half = lw / 2;
+
+  ctx.beginPath();
+  if (el.shapeType === 'line') {
+    const x1 = el.lineFlipH ? wPx - half : half;
+    const y1 = el.lineFlipV ? hPx - half : half;
+    const x2 = el.lineFlipH ? half : wPx - half;
+    const y2 = el.lineFlipV ? half : hPx - half;
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+  } else if (el.shapeType === 'ellipse') {
+    ctx.ellipse(wPx / 2, hPx / 2, Math.max(1, wPx / 2 - half), Math.max(1, hPx / 2 - half), 0, 0, Math.PI * 2);
+  } else if (el.shapeType === 'roundRect') {
+    const r = Math.min(wPx, hPx) * (el.rectRadiusRatio ?? 0.08);
+    ctx.roundRect(half, half, Math.max(1, wPx - lw), Math.max(1, hPx - lw), r);
+  } else {
+    ctx.rect(half, half, Math.max(1, wPx - lw), Math.max(1, hPx - lw));
+  }
+
+  if (el.fillHex && el.shapeType !== 'line') {
+    ctx.fillStyle = `#${el.fillHex}`;
+    ctx.fill();
+  }
+  if (el.strokeHex && lw > 0) {
+    ctx.strokeStyle = `#${el.strokeHex}`;
+    ctx.lineWidth = lw;
+    ctx.stroke();
+  }
+
+  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
+  if (!blob) return null;
+  return {
+    pngBytes: new Uint8Array(await blob.arrayBuffer()),
+    widthPx: wPx / scale,
+    heightPx: hPx / scale,
+  };
+}
 
 /**
  * PDF → Imágenes (PNG / JPG / WebP). Si tiene >1 página empaqueta en .zip localmente.
@@ -86,279 +143,11 @@ export async function convertPdfToImages(
 }
 
 /**
- * PDF → Word (.docx) fiel al diseño original y completamente editable (arquitectura DOCXFlt / SolidFramework).
- * - Conserva dimensiones y orientación reales de cada página.
- * - En páginas con diseño gráfico / columnas / infografías: coloca el diseño de fondo limpio detrás
- *   (`behindDocument: true`), cada foto recortada con su máscara como imagen flotante independiente y
- *   cada bloque de texto en su coordenada exacta (`frame` OpenXML) con color, fuente, tamaño y alineación reales.
- * - En páginas de texto continuo sencillo: genera párrafos y títulos fluidos editables.
- */
-export async function convertPdfToDocx(
-  buffer: ArrayBuffer,
-  baseName: string,
-  onProgress?: (p: ProgressInfo) => void
-): Promise<{ blob: Blob; filename: string }> {
-  const cleanName = baseName.replace(/\.pdf$/i, '');
-  onProgress?.({ percent: 6, message: 'Preparando motor de reconstrucción Word...' });
-
-  const [pdf, docx] = await Promise.all([loadPdfDocument(buffer), import('docx')]);
-  const {
-    Document,
-    Packer,
-    Paragraph,
-    TextRun,
-    HeadingLevel,
-    ImageRun,
-    AlignmentType,
-    FrameAnchorType,
-    FrameWrap,
-    HorizontalPositionRelativeFrom,
-    VerticalPositionRelativeFrom,
-    TextWrappingType,
-    PageOrientation,
-  } = docx;
-
-  // 1 pt = 20 twips; 1 pt = 12700 EMUs; 1 pt = 96/72 CSS px (docx ImageRun usa px a 96 DPI)
-  const PT_TO_TWIPS = 20;
-  const PT_TO_EMU = 12700;
-  const PT_TO_PX = 96 / 72;
-
-  const sections: Array<{
-    properties: Record<string, unknown>;
-    children: Array<InstanceType<typeof Paragraph>>;
-  }> = [];
-
-  try {
-    for (let p = 1; p <= pdf.numPages; p++) {
-      const pct = 10 + Math.round(((p - 0.5) / pdf.numPages) * 80);
-      onProgress?.({
-        percent: pct,
-        message: `Reconstruyendo diseño y texto de página ${p} de ${pdf.numPages}...`,
-      });
-
-      const page = await pdf.getPage(p);
-      const scene = await analyzePdfPage(page, p, (msg) =>
-        onProgress?.({ percent: pct, message: msg })
-      );
-
-      const pageWTrips = Math.round(scene.widthPt * PT_TO_TWIPS);
-      const pageHTrips = Math.round(scene.heightPt * PT_TO_TWIPS);
-
-      const pageChildren: Array<InstanceType<typeof Paragraph>> = [];
-
-      if (scene.hasComplexLayout) {
-        // Ancla de capas gráficas (fondo limpio detrás + imágenes recortadas independientes)
-        const graphicRuns: Array<InstanceType<typeof ImageRun>> = [];
-
-        if (scene.backgroundLayer) {
-          graphicRuns.push(
-            new ImageRun({
-              data: scene.backgroundLayer.pngBytes,
-              type: 'png',
-              transformation: {
-                width: Math.round(scene.widthPt * PT_TO_PX),
-                height: Math.round(scene.heightPt * PT_TO_PX),
-              },
-              floating: {
-                horizontalPosition: {
-                  relative: HorizontalPositionRelativeFrom.PAGE,
-                  offset: 0,
-                },
-                verticalPosition: {
-                  relative: VerticalPositionRelativeFrom.PAGE,
-                  offset: 0,
-                },
-                behindDocument: true,
-                allowOverlap: true,
-                zIndex: 0,
-                wrap: { type: TextWrappingType.NONE },
-              },
-            })
-          );
-        }
-
-        scene.images.forEach((img, idx) => {
-          graphicRuns.push(
-            new ImageRun({
-              data: img.pngBytes,
-              type: 'png',
-              transformation: {
-                width: Math.max(16, Math.round(img.width * scene.widthPt * PT_TO_PX)),
-                height: Math.max(16, Math.round(img.height * scene.heightPt * PT_TO_PX)),
-              },
-              floating: {
-                horizontalPosition: {
-                  relative: HorizontalPositionRelativeFrom.PAGE,
-                  offset: Math.round(img.x * scene.widthPt * PT_TO_EMU),
-                },
-                verticalPosition: {
-                  relative: VerticalPositionRelativeFrom.PAGE,
-                  offset: Math.round(img.y * scene.heightPt * PT_TO_EMU),
-                },
-                behindDocument: false,
-                allowOverlap: true,
-                zIndex: 10 + idx,
-                wrap: { type: TextWrappingType.NONE },
-              },
-            })
-          );
-        });
-
-        if (graphicRuns.length > 0) {
-          pageChildren.push(
-            new Paragraph({
-              spacing: { before: 0, after: 0, line: 240 },
-              children: graphicRuns,
-            })
-          );
-        }
-
-        // Cada párrafo en su posición exacta editable mediante OpenXML Frame
-        for (const para of scene.paragraphs) {
-          const frameX = Math.max(0, Math.round(para.x * pageWTrips));
-          const frameY = Math.max(0, Math.round(para.y * pageHTrips));
-          const frameW = Math.min(
-            pageWTrips - frameX,
-            Math.max(720, Math.round((para.width + 0.03) * pageWTrips))
-          );
-
-          const alignment =
-            para.align === 'center'
-              ? AlignmentType.CENTER
-              : para.align === 'right'
-                ? AlignmentType.RIGHT
-                : AlignmentType.LEFT;
-
-          const runs: Array<InstanceType<typeof TextRun>> = [];
-          para.lines.forEach((line, lIdx) => {
-            runs.push(
-              new TextRun({
-                text: line.text,
-                font: line.fontFamily,
-                size: Math.round(Math.max(14, Math.min(96, line.fontSizePt * 2))),
-                bold: line.bold,
-                italics: line.italic,
-                color: line.colorHex,
-                break: lIdx > 0 ? 1 : undefined,
-              })
-            );
-          });
-
-          pageChildren.push(
-            new Paragraph({
-              alignment,
-              spacing: { before: 0, after: 0, line: Math.round(para.fontSizePt * 24) },
-              frame: {
-                type: 'absolute',
-                position: { x: frameX, y: frameY },
-                width: frameW,
-                anchor: {
-                  horizontal: FrameAnchorType.PAGE,
-                  vertical: FrameAnchorType.PAGE,
-                },
-                wrap: FrameWrap.NONE,
-                space: { horizontal: 0, vertical: 0 },
-              },
-              children: runs,
-            })
-          );
-        }
-
-        if (pageChildren.length === 0) {
-          pageChildren.push(new Paragraph({ children: [] }));
-        }
-
-        sections.push({
-          properties: {
-            page: {
-              size: {
-                width: scene.isLandscape ? pageHTrips : pageWTrips,
-                height: scene.isLandscape ? pageWTrips : pageHTrips,
-                orientation: scene.isLandscape
-                  ? PageOrientation.LANDSCAPE
-                  : PageOrientation.PORTRAIT,
-              },
-              margin: { top: 360, bottom: 360, left: 360, right: 360 },
-            },
-          },
-          children: pageChildren,
-        });
-      } else {
-        // Página de documento textual limpio → párrafos fluidos naturales con estilos y colores reales
-        const sizes = scene.paragraphs.map((b) => b.fontSizePt).sort((a, b) => a - b);
-        const medianSize = sizes[Math.floor(sizes.length / 2)] || 11;
-
-        for (const para of scene.paragraphs) {
-          const isH1 = para.fontSizePt >= medianSize * 1.45 && para.text.length < 140;
-          const isH2 = !isH1 && para.fontSizePt >= medianSize * 1.2 && para.text.length < 160;
-          const alignment =
-            para.align === 'center'
-              ? AlignmentType.CENTER
-              : para.align === 'right'
-                ? AlignmentType.RIGHT
-                : AlignmentType.LEFT;
-
-          pageChildren.push(
-            new Paragraph({
-              heading: isH1
-                ? HeadingLevel.HEADING_1
-                : isH2
-                  ? HeadingLevel.HEADING_2
-                  : undefined,
-              alignment,
-              spacing: { after: isH1 || isH2 ? 160 : 100 },
-              children: [
-                new TextRun({
-                  text: para.lines.map((l) => l.text).join(' '),
-                  font: para.fontFamily,
-                  bold: para.bold || isH1 || isH2,
-                  italics: para.italic,
-                  color: para.colorHex,
-                  size: Math.round(Math.max(16, Math.min(56, para.fontSizePt * 2))),
-                }),
-              ],
-            })
-          );
-        }
-
-        sections.push({
-          properties: {
-            page: {
-              size: {
-                width: scene.isLandscape ? pageHTrips : pageWTrips,
-                height: scene.isLandscape ? pageWTrips : pageHTrips,
-                orientation: scene.isLandscape
-                  ? PageOrientation.LANDSCAPE
-                  : PageOrientation.PORTRAIT,
-              },
-              margin: { top: 1080, bottom: 1080, left: 1080, right: 1080 },
-            },
-          },
-          children: pageChildren.length > 0 ? pageChildren : [new Paragraph({ children: [] })],
-        });
-      }
-    }
-
-    onProgress?.({ percent: 94, message: 'Empaquetando documento Word (.docx)...' });
-    const doc = new Document({
-      creator: 'PDFStudio Local',
-      title: cleanName,
-      sections,
-    });
-    const blob = await Packer.toBlob(doc);
-    onProgress?.({ percent: 100, message: 'Documento Word listo' });
-    return { blob, filename: `${cleanName}.docx` };
-  } finally {
-    await destroyPdfDocument(pdf);
-  }
-}
-
-/**
- * PDF → PowerPoint (.pptx) fiel al diseño original y completamente editable (arquitectura PptxFlt).
- * - Preserva proporción exacta del PDF en la diapositiva.
- * - Capa 1: Diseño vectorial/fondo completo sin texto (fondos, formas, degradados, líneas, bordes).
- * - Capa 2: Cada foto/gráfico embebido recortado con su máscara exacta (círculos, clips) como objeto movible.
- * - Capa 3: Cada bloque de texto como cuadro nativo editable con color, fuente, tamaño, alineación y rotación reales.
+ * PDF → PowerPoint (.pptx) con TODOS LOS ELEMENTOS SEPARADOS Y EDITABLES:
+ * - Fondo sólido nativo (`slide.background`), SIN imagen gigante tapando la diapositiva.
+ * - Formas geométricas nativas editables (`rect`, `roundRect`, `ellipse`, `line`) mediante `slide.addShape`.
+ * - Cada ilustración/pétalo/imagen como su propio objeto independiente recortado con transparencia.
+ * - Cada bloque de texto como cuadro de texto nativo editable con color, fuente, tamaño, alineación y rotación exactos.
  */
 export async function convertPdfToPptx(
   buffer: ArrayBuffer,
@@ -375,7 +164,6 @@ export async function convertPdfToPptx(
   pptx.author = 'PDFStudio Local';
 
   try {
-    // Configurar dimensiones exactas de diapositiva según página 1
     const firstPage = await pdf.getPage(1);
     const firstVp = firstPage.getViewport({ scale: 1 });
     const aspect = firstVp.width / Math.max(1, firstVp.height);
@@ -395,7 +183,7 @@ export async function convertPdfToPptx(
       const pct = 10 + Math.round(((p - 0.5) / pdf.numPages) * 80);
       onProgress?.({
         percent: pct,
-        message: `Reconstruyendo diapositiva ${p} de ${pdf.numPages}...`,
+        message: `Descomponiendo objetos de diapositiva ${p} de ${pdf.numPages}...`,
       });
 
       const page = await pdf.getPage(p);
@@ -405,37 +193,68 @@ export async function convertPdfToPptx(
 
       const slide = pptx.addSlide();
 
-      // Capa 1: Fondo y diseño gráfico limpio sin texto (preserva 100% de formas, degradados, bordes y líneas)
-      if (scene.backgroundLayer) {
-        slide.addImage({
-          data: scene.backgroundLayer.dataUrl,
-          x: 0,
-          y: 0,
-          w: slideW,
-          h: slideH,
-        });
+      // 1) Fondo nativo de la diapositiva (NO es una imagen seleccionable encima!)
+      if (scene.scannedFallbackBg) {
+        slide.background = { data: scene.scannedFallbackBg.dataUrl };
+      } else {
+        slide.background = { color: scene.pageBackgroundHex || 'FFFFFF' };
       }
 
-      // Capa 2: Cada foto/ilustración embebida con su máscara exacta como objeto movible independiente
-      for (const img of scene.images) {
-        slide.addImage({
-          data: img.dataUrl,
-          x: img.x * slideW,
-          y: img.y * slideH,
-          w: Math.max(0.2, img.width * slideW),
-          h: Math.max(0.2, img.height * slideH),
-        });
-      }
-
-      // Capa 3: Cuadros de texto nativos editables con color, fuente, tamaño, alineación y rotación reales
       const ptScale = (slideW * 72) / Math.max(1, scene.widthPt);
 
+      // 2) Cada forma nativa y cada gráfico/imagen por separado en su zOrder original
+      for (const el of scene.elements) {
+        if (el.kind === 'shape') {
+          const x = el.x * slideW;
+          const y = el.y * slideH;
+          const w = Math.max(0.02, el.width * slideW);
+          const h = Math.max(0.02, el.height * slideH);
+          const lineWidthPt = el.strokeWidthPt ? Math.max(0.5, el.strokeWidthPt * ptScale) : 0;
+
+          const shapeTypeMap = {
+            rect: pptx.ShapeType.rect,
+            roundRect: pptx.ShapeType.roundRect,
+            ellipse: pptx.ShapeType.ellipse,
+            line: pptx.ShapeType.line,
+          };
+
+          slide.addShape(shapeTypeMap[el.shapeType], {
+            x,
+            y,
+            w: el.shapeType === 'line' && el.width < 0.005 ? 0 : w,
+            h: el.shapeType === 'line' && el.height < 0.005 ? 0 : h,
+            fill:
+              el.fillHex && el.shapeType !== 'line'
+                ? { color: el.fillHex }
+                : { type: 'none' },
+            line:
+              el.strokeHex && lineWidthPt > 0
+                ? { color: el.strokeHex, width: lineWidthPt }
+                : { type: 'none' },
+            rectRadius:
+              el.shapeType === 'roundRect'
+                ? Math.max(0.04, Math.min(0.35, (el.rectRadiusRatio ?? 0.08) * 1.4))
+                : undefined,
+            flipH: el.shapeType === 'line' ? el.lineFlipH : undefined,
+            flipV: el.shapeType === 'line' ? el.lineFlipV : undefined,
+          });
+        } else {
+          slide.addImage({
+            data: el.dataUrl,
+            x: el.x * slideW,
+            y: el.y * slideH,
+            w: Math.max(0.12, el.width * slideW),
+            h: Math.max(0.12, el.height * slideH),
+          });
+        }
+      }
+
+      // 3) Cuadros de texto nativos editables
       for (const para of scene.paragraphs) {
         const isVertical = Math.abs(Math.abs(para.angleDeg) - 90) < 18;
         const scaledFont = Math.max(7, Math.min(64, Math.round(para.fontSizePt * ptScale * 0.94)));
 
         if (isVertical) {
-          // En PowerPoint, rotate gira alrededor del centro del cuadro; invertimos w/h y centramos en la caja original
           const origW = Math.max(0.28, para.width * slideW);
           const origH = Math.max(0.5, para.height * slideH + 0.2);
           const cx = para.x * slideW + origW / 2;
@@ -511,12 +330,285 @@ export async function convertPdfToPptx(
 }
 
 /**
- * Convierte cadenas numéricas limpias (ej. "1821", "2 430", "$1,250.50") en número real para Excel si procede.
+ * PDF → Word (.docx) con objetos separados y texto editable (sin imagen gigante aplastando la página).
  */
+export async function convertPdfToDocx(
+  buffer: ArrayBuffer,
+  baseName: string,
+  onProgress?: (p: ProgressInfo) => void
+): Promise<{ blob: Blob; filename: string }> {
+  const cleanName = baseName.replace(/\.pdf$/i, '');
+  onProgress?.({ percent: 6, message: 'Preparando motor de reconstrucción Word...' });
+
+  const [pdf, docx] = await Promise.all([loadPdfDocument(buffer), import('docx')]);
+  const {
+    Document,
+    Packer,
+    Paragraph,
+    TextRun,
+    HeadingLevel,
+    ImageRun,
+    AlignmentType,
+    FrameAnchorType,
+    FrameWrap,
+    HorizontalPositionRelativeFrom,
+    VerticalPositionRelativeFrom,
+    TextWrappingType,
+    PageOrientation,
+  } = docx;
+
+  const PT_TO_TWIPS = 20;
+  const PT_TO_EMU = 12700;
+  const PT_TO_PX = 96 / 72;
+
+  const sections: Array<{
+    properties: Record<string, unknown>;
+    children: Array<InstanceType<typeof Paragraph>>;
+  }> = [];
+
+  let docBgHex: string | undefined;
+
+  try {
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const pct = 10 + Math.round(((p - 0.5) / pdf.numPages) * 80);
+      onProgress?.({
+        percent: pct,
+        message: `Descomponiendo objetos de página ${p} de ${pdf.numPages}...`,
+      });
+
+      const page = await pdf.getPage(p);
+      const scene = await analyzePdfPage(page, p, (msg) =>
+        onProgress?.({ percent: pct, message: msg })
+      );
+
+      if (p === 1 && scene.pageBackgroundHex && scene.pageBackgroundHex !== 'FFFFFF') {
+        docBgHex = scene.pageBackgroundHex;
+      }
+
+      const pageWTrips = Math.round(scene.widthPt * PT_TO_TWIPS);
+      const pageHTrips = Math.round(scene.heightPt * PT_TO_TWIPS);
+      const pageChildren: Array<InstanceType<typeof Paragraph>> = [];
+
+      if (scene.hasComplexLayout) {
+        const graphicRuns: Array<InstanceType<typeof ImageRun>> = [];
+
+        if (scene.scannedFallbackBg) {
+          graphicRuns.push(
+            new ImageRun({
+              data: scene.scannedFallbackBg.pngBytes,
+              type: 'png',
+              transformation: {
+                width: Math.round(scene.widthPt * PT_TO_PX),
+                height: Math.round(scene.heightPt * PT_TO_PX),
+              },
+              floating: {
+                horizontalPosition: { relative: HorizontalPositionRelativeFrom.PAGE, offset: 0 },
+                verticalPosition: { relative: VerticalPositionRelativeFrom.PAGE, offset: 0 },
+                behindDocument: true,
+                allowOverlap: true,
+                zIndex: 0,
+                wrap: { type: TextWrappingType.NONE },
+              },
+            })
+          );
+        }
+
+        // Insertar cada elemento (forma, pétalo, imagen) como su propio objeto separado en su coordenada exacta
+        for (let idx = 0; idx < scene.elements.length; idx++) {
+          const el = scene.elements[idx];
+          let pngBytes: Uint8Array | null = null;
+          let widthPx = Math.max(8, Math.round(el.width * scene.widthPt * PT_TO_PX));
+          let heightPx = Math.max(8, Math.round(el.height * scene.heightPt * PT_TO_PX));
+
+          if (el.kind === 'graphic') {
+            pngBytes = el.pngBytes;
+          } else {
+            const rendered = await renderShapeElementToPng(el, scene.widthPt, scene.heightPt);
+            if (rendered) {
+              pngBytes = rendered.pngBytes;
+              widthPx = Math.max(4, Math.round(rendered.widthPx * PT_TO_PX));
+              heightPx = Math.max(4, Math.round(rendered.heightPx * PT_TO_PX));
+            }
+          }
+
+          if (!pngBytes) continue;
+          const isLargeContainer = el.width > 0.72 && el.height > 0.72;
+
+          graphicRuns.push(
+            new ImageRun({
+              data: pngBytes,
+              type: 'png',
+              transformation: { width: widthPx, height: heightPx },
+              floating: {
+                horizontalPosition: {
+                  relative: HorizontalPositionRelativeFrom.PAGE,
+                  offset: Math.round(el.x * scene.widthPt * PT_TO_EMU),
+                },
+                verticalPosition: {
+                  relative: VerticalPositionRelativeFrom.PAGE,
+                  offset: Math.round(el.y * scene.heightPt * PT_TO_EMU),
+                },
+                behindDocument: isLargeContainer,
+                allowOverlap: true,
+                zIndex: isLargeContainer ? 1 : 10 + idx,
+                wrap: { type: TextWrappingType.NONE },
+              },
+            })
+          );
+        }
+
+        if (graphicRuns.length > 0) {
+          pageChildren.push(
+            new Paragraph({
+              spacing: { before: 0, after: 0, line: 240 },
+              children: graphicRuns,
+            })
+          );
+        }
+
+        // Cada bloque de texto en su posición exacta editable
+        for (const para of scene.paragraphs) {
+          const frameX = Math.max(0, Math.round(para.x * pageWTrips));
+          const frameY = Math.max(0, Math.round(para.y * pageHTrips));
+          const frameW = Math.min(
+            pageWTrips - frameX,
+            Math.max(720, Math.round((para.width + 0.03) * pageWTrips))
+          );
+
+          const alignment =
+            para.align === 'center'
+              ? AlignmentType.CENTER
+              : para.align === 'right'
+                ? AlignmentType.RIGHT
+                : AlignmentType.LEFT;
+
+          const runs: Array<InstanceType<typeof TextRun>> = [];
+          para.lines.forEach((line, lIdx) => {
+            runs.push(
+              new TextRun({
+                text: line.text,
+                font: line.fontFamily,
+                size: Math.round(Math.max(14, Math.min(96, line.fontSizePt * 2))),
+                bold: line.bold,
+                italics: line.italic,
+                color: line.colorHex,
+                break: lIdx > 0 ? 1 : undefined,
+              })
+            );
+          });
+
+          pageChildren.push(
+            new Paragraph({
+              alignment,
+              spacing: { before: 0, after: 0, line: Math.round(para.fontSizePt * 24) },
+              frame: {
+                type: 'absolute',
+                position: { x: frameX, y: frameY },
+                width: frameW,
+                anchor: {
+                  horizontal: FrameAnchorType.PAGE,
+                  vertical: FrameAnchorType.PAGE,
+                },
+                wrap: FrameWrap.NONE,
+                space: { horizontal: 0, vertical: 0 },
+              },
+              children: runs,
+            })
+          );
+        }
+
+        if (pageChildren.length === 0) {
+          pageChildren.push(new Paragraph({ children: [] }));
+        }
+
+        sections.push({
+          properties: {
+            page: {
+              size: {
+                width: scene.isLandscape ? pageHTrips : pageWTrips,
+                height: scene.isLandscape ? pageWTrips : pageHTrips,
+                orientation: scene.isLandscape
+                  ? PageOrientation.LANDSCAPE
+                  : PageOrientation.PORTRAIT,
+              },
+              margin: { top: 360, bottom: 360, left: 360, right: 360 },
+            },
+          },
+          children: pageChildren,
+        });
+      } else {
+        const sizes = scene.paragraphs.map((b) => b.fontSizePt).sort((a, b) => a - b);
+        const medianSize = sizes[Math.floor(sizes.length / 2)] || 11;
+
+        for (const para of scene.paragraphs) {
+          const isH1 = para.fontSizePt >= medianSize * 1.45 && para.text.length < 140;
+          const isH2 = !isH1 && para.fontSizePt >= medianSize * 1.2 && para.text.length < 160;
+          const alignment =
+            para.align === 'center'
+              ? AlignmentType.CENTER
+              : para.align === 'right'
+                ? AlignmentType.RIGHT
+                : AlignmentType.LEFT;
+
+          pageChildren.push(
+            new Paragraph({
+              heading: isH1
+                ? HeadingLevel.HEADING_1
+                : isH2
+                  ? HeadingLevel.HEADING_2
+                  : undefined,
+              alignment,
+              spacing: { after: isH1 || isH2 ? 160 : 100 },
+              children: [
+                new TextRun({
+                  text: para.lines.map((l) => l.text).join(' '),
+                  font: para.fontFamily,
+                  bold: para.bold || isH1 || isH2,
+                  italics: para.italic,
+                  color: para.colorHex,
+                  size: Math.round(Math.max(16, Math.min(56, para.fontSizePt * 2))),
+                }),
+              ],
+            })
+          );
+        }
+
+        sections.push({
+          properties: {
+            page: {
+              size: {
+                width: scene.isLandscape ? pageHTrips : pageWTrips,
+                height: scene.isLandscape ? pageWTrips : pageHTrips,
+                orientation: scene.isLandscape
+                  ? PageOrientation.LANDSCAPE
+                  : PageOrientation.PORTRAIT,
+              },
+              margin: { top: 1080, bottom: 1080, left: 1080, right: 1080 },
+            },
+          },
+          children: pageChildren.length > 0 ? pageChildren : [new Paragraph({ children: [] })],
+        });
+      }
+    }
+
+    onProgress?.({ percent: 94, message: 'Empaquetando documento Word (.docx)...' });
+    const doc = new Document({
+      creator: 'PDFStudio Local',
+      title: cleanName,
+      background: docBgHex ? { color: docBgHex } : undefined,
+      sections,
+    });
+    const blob = await Packer.toBlob(doc);
+    onProgress?.({ percent: 100, message: 'Documento Word listo' });
+    return { blob, filename: `${cleanName}.docx` };
+  } finally {
+    await destroyPdfDocument(pdf);
+  }
+}
+
 function parseExcelCellValue(raw: string): string | number {
   const trimmed = raw.trim();
   if (!trimmed) return '';
-  // Enteros o decimales simples sin unidades de texto
   if (/^-?\d+(\.\d+)?$/.test(trimmed)) {
     const n = Number(trimmed);
     if (Number.isFinite(n)) return n;
@@ -557,7 +649,6 @@ export async function convertPdfToExcel(
         onProgress?.({ percent: pct, message: msg })
       );
 
-      // Agrupar líneas por filas (eje Y)
       const sorted = [...scene.rawLines].sort((a, b) =>
         Math.abs(a.y - b.y) > 0.012 ? a.y - b.y : a.x - b.x
       );
@@ -572,7 +663,6 @@ export async function convertPdfToExcel(
         }
       }
 
-      // Detectar anclas de columna globales por clustering en X para alinear celdas vacías correctamente
       const allXs = sorted.map((l) => l.x).sort((a, b) => a - b);
       const colAnchors: number[] = [];
       for (const x of allXs) {
@@ -600,7 +690,6 @@ export async function convertPdfToExcel(
           }
           cells[bestCol] = cells[bestCol] ? `${cells[bestCol]} ${item.text}` : item.text;
         }
-        // Recortar columnas vacías al final de cada fila
         while (cells.length > 1 && !cells[cells.length - 1]) cells.pop();
         return cells.map((c) => parseExcelCellValue(c));
       });
@@ -609,8 +698,6 @@ export async function convertPdfToExcel(
       allRows.push(...safeRows);
 
       const ws = XLSX.utils.aoa_to_sheet(safeRows);
-
-      // Calcular anchos de columna automáticos para lectura cómoda en Excel
       const colWidths: Array<{ wch: number }> = [];
       for (const r of safeRows) {
         r.forEach((cell, idx) => {
@@ -646,7 +733,7 @@ export async function convertPdfToExcel(
 }
 
 /**
- * PDF → HTML fiel y adaptable (con diseño intacto y textos seleccionables) o TXT limpio.
+ * PDF → HTML adaptable con todos los objetos separados (fondo CSS, formas SVG/DIV, gráficos e imágenes y texto editable) o TXT.
  */
 export async function convertPdfToTextOrHtml(
   buffer: ArrayBuffer,
@@ -677,19 +764,46 @@ export async function convertPdfToTextOrHtml(
       pagesText.push(scene.paragraphs.map((b) => b.text).join('\n\n'));
 
       if (format === 'html') {
-        const bgTag = scene.backgroundLayer
-          ? `<img class="bg" src="${scene.backgroundLayer.dataUrl}" alt="" />`
+        const bgTag = scene.scannedFallbackBg
+          ? `<img class="bg" src="${scene.scannedFallbackBg.dataUrl}" alt="" />`
           : '';
-        const imgTags = scene.images
-          .map(
-            (img) =>
-              `<img class="obj" src="${img.dataUrl}" alt="" style="left:${(img.x * 100).toFixed(
-                3
-              )}%;top:${(img.y * 100).toFixed(3)}%;width:${(img.width * 100).toFixed(
-                3
-              )}%;height:${(img.height * 100).toFixed(3)}%" />`
-          )
+
+        const elementTags = scene.elements
+          .map((el) => {
+            const left = (el.x * 100).toFixed(3);
+            const top = (el.y * 100).toFixed(3);
+            const width = (el.width * 100).toFixed(3);
+            const height = (el.height * 100).toFixed(3);
+
+            if (el.kind === 'graphic') {
+              return `<img class="obj" src="${el.dataUrl}" alt="" style="left:${left}%;top:${top}%;width:${width}%;height:${height}%" />`;
+            }
+
+            if (el.shapeType === 'line') {
+              const thickness = Math.max(1, el.strokeWidthPt || 1);
+              const isVert = el.width < el.height;
+              return `<div class="shp" style="left:${left}%;top:${top}%;width:${
+                isVert ? `${thickness}px` : `${width}%`
+              };height:${isVert ? `${height}%` : `${thickness}px`};background:#${
+                el.strokeHex || '111827'
+              }"></div>`;
+            }
+
+            const radius =
+              el.shapeType === 'ellipse'
+                ? '50%'
+                : el.shapeType === 'roundRect'
+                  ? `${Math.round((el.rectRadiusRatio ?? 0.08) * 180)}px`
+                  : '0';
+            const bg = el.fillHex ? `background:#${el.fillHex};` : '';
+            const border =
+              el.strokeHex && el.strokeWidthPt
+                ? `border:${Math.max(1, el.strokeWidthPt)}px solid #${el.strokeHex};`
+                : '';
+            return `<div class="shp" style="left:${left}%;top:${top}%;width:${width}%;height:${height}%;border-radius:${radius};${bg}${border}"></div>`;
+          })
           .join('');
+
         const textTags = scene.paragraphs
           .map((para) => {
             const isVert = Math.abs(Math.abs(para.angleDeg) - 90) < 18;
@@ -712,7 +826,7 @@ export async function convertPdfToTextOrHtml(
         htmlPages.push(
           `<section class="pdf-page" style="aspect-ratio:${scene.widthPt.toFixed(
             2
-          )}/${scene.heightPt.toFixed(2)}">${bgTag}${imgTags}${textTags}</section>`
+          )}/${scene.heightPt.toFixed(2)};background:#${scene.pageBackgroundHex}">${bgTag}${elementTags}${textTags}</section>`
         );
       }
     }
@@ -727,7 +841,7 @@ export async function convertPdfToTextOrHtml(
 
     const html = `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(
       cleanName
-    )}</title><style>*{box-sizing:border-box}body{margin:0;padding:24px 12px;background:#eef2f7;font-family:system-ui,sans-serif;display:flex;flex-direction:column;align-items:center;gap:24px}.pdf-page{position:relative;width:min(100%,960px);background:#fff;box-shadow:0 8px 28px rgba(15,23,42,.12);border-radius:6px;overflow:hidden;container-type:inline-size}.pdf-page .bg{position:absolute;inset:0;width:100%;height:100%;object-fit:fill;pointer-events:none}.pdf-page .obj{position:absolute;object-fit:contain}.pdf-page .txt{position:absolute;line-height:1.18;outline:none;white-space:pre-wrap}.pdf-page .txt:focus{outline:1px dashed #2563eb;background:rgba(37,99,235,.06)}</style></head><body>${htmlPages.join(
+    )}</title><style>*{box-sizing:border-box}body{margin:0;padding:24px 12px;background:#eef2f7;font-family:system-ui,sans-serif;display:flex;flex-direction:column;align-items:center;gap:24px}.pdf-page{position:relative;width:min(100%,960px);box-shadow:0 8px 28px rgba(15,23,42,.12);border-radius:6px;overflow:hidden;container-type:inline-size}.pdf-page .bg{position:absolute;inset:0;width:100%;height:100%;object-fit:fill;pointer-events:none}.pdf-page .shp{position:absolute}.pdf-page .obj{position:absolute;object-fit:contain}.pdf-page .txt{position:absolute;line-height:1.18;outline:none;white-space:pre-wrap}.pdf-page .txt:focus{outline:1px dashed #2563eb;background:rgba(37,99,235,.06)}</style></head><body>${htmlPages.join(
       ''
     )}</body></html>`;
 

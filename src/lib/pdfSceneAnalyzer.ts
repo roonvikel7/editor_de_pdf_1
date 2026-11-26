@@ -32,28 +32,52 @@ export interface RichTextParagraph {
   angleDeg: number;
 }
 
-export interface SceneImageObject {
-  id: string;
-  dataUrl: string;
-  pngBytes: Uint8Array;
-  x: number; // 0..1
-  y: number; // 0..1
-  width: number; // 0..1
-  height: number; // 0..1
-  pixelWidth: number;
-  pixelHeight: number;
-}
+export type SceneGraphicElement =
+  | {
+      kind: 'shape';
+      id: string;
+      zOrder: number;
+      shapeType: 'rect' | 'roundRect' | 'ellipse' | 'line';
+      x: number; // 0..1
+      y: number; // 0..1
+      width: number; // 0..1
+      height: number; // 0..1
+      fillHex?: string; // sin '#'
+      fillAlpha?: number;
+      strokeHex?: string; // sin '#'
+      strokeWidthPt?: number;
+      rectRadiusRatio?: number;
+      lineFlipH?: boolean;
+      lineFlipV?: boolean;
+    }
+  | {
+      kind: 'graphic';
+      id: string;
+      zOrder: number;
+      dataUrl: string;
+      pngBytes: Uint8Array;
+      x: number; // 0..1
+      y: number; // 0..1
+      width: number; // 0..1
+      height: number; // 0..1
+      pixelWidth: number;
+      pixelHeight: number;
+    };
 
 export interface AnalyzedPdfPage {
   pageNumber: number;
   widthPt: number;
   heightPt: number;
   isLandscape: boolean;
+  /** Color sólido de fondo de la página/diapositiva (sin '#', ej 'FFFFFF' o '62A7C4') */
+  pageBackgroundHex: string;
+  /** Todos los elementos visuales separados (formas nativas editables, grupos vectoriales e imágenes) en z-order real */
+  elements: SceneGraphicElement[];
+  /** Textos agrupados en párrafos editables */
   paragraphs: RichTextParagraph[];
   rawLines: RichTextLine[];
-  images: SceneImageObject[];
-  /** Capa gráfica de diseño completa sin texto ni imágenes extraídas (null si la página es blanca lisa) */
-  backgroundLayer: {
+  /** Solo si la página entera es 1 foto escaneada sin vectores ni texto nativo */
+  scannedFallbackBg: {
     dataUrl: string;
     pngBytes: Uint8Array;
     pixelWidth: number;
@@ -67,9 +91,6 @@ type OperationsFilterFn = (
   operatorList: { fnArray: number[]; argsArray: unknown[] }
 ) => boolean;
 
-/**
- * Renderiza una página PDF.js con soporte nativo de `operationsFilter` y fondo transparente opcional.
- */
 async function renderPageFiltered(
   page: PDFPageProxy,
   scale: number,
@@ -87,7 +108,7 @@ async function renderPageFiltered(
     alpha: Boolean(options.transparent),
     willReadFrequently: true,
   });
-  if (!ctx) throw new Error('No se pudo crear contexto 2D para renderizar la página.');
+  if (!ctx) throw new Error('No se pudo crear contexto 2D.');
 
   if (options.transparent) {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -104,15 +125,10 @@ async function renderPageFiltered(
     operationsFilter: options.operationsFilter,
   };
 
-  // pdfjs-dist@6 soporta `operationsFilter` de forma nativa en InternalRenderTask
   await page.render(renderParams as Parameters<PDFPageProxy['render']>[0]).promise;
   return canvas;
 }
 
-/**
- * Equivalente web a PdfFontMapper.txt de SolidFramework:
- * Traduce nombres de fuentes embebidas PDF a fuentes estándar limpias de Office/Web.
- */
 export function mapPdfFontFamily(rawFontName: string, styleFamily?: string): {
   family: string;
   bold: boolean;
@@ -148,6 +164,35 @@ function rgbToHex(r: number, g: number, b: number): string {
   ).toUpperCase();
 }
 
+function parseColorArgToHex(arg: unknown): string | undefined {
+  if (!arg) return undefined;
+  if (typeof arg === 'string') {
+    const s = arg.trim();
+    if (s === 'transparent' || s === 'none') return undefined;
+    if (s.startsWith('#')) {
+      const clean = s.slice(1);
+      if (clean.length === 6) return clean.toUpperCase();
+      if (clean.length === 3) {
+        return (clean[0] + clean[0] + clean[1] + clean[1] + clean[2] + clean[2]).toUpperCase();
+      }
+    }
+    const m = s.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+    if (m) return rgbToHex(Number(m[1]), Number(m[2]), Number(m[3]));
+  }
+  if (Array.isArray(arg) || ArrayBuffer.isView(arg)) {
+    const arr = Array.from(arg as ArrayLike<number>);
+    if (arr.length >= 3) {
+      const scale = arr[0] <= 1 && arr[1] <= 1 && arr[2] <= 1 ? 255 : 1;
+      return rgbToHex(arr[0] * scale, arr[1] * scale, arr[2] * scale);
+    }
+    if (arr.length === 1) {
+      const v = arr[0] <= 1 ? arr[0] * 255 : arr[0];
+      return rgbToHex(v, v, v);
+    }
+  }
+  return undefined;
+}
+
 function colorDistSq(r1: number, g1: number, b1: number, r2: number, g2: number, b2: number): number {
   const dr = r1 - r2;
   const dg = g1 - g2;
@@ -155,10 +200,21 @@ function colorDistSq(r1: number, g1: number, b1: number, r2: number, g2: number,
   return dr * dr + dg * dg + db * db;
 }
 
-/**
- * Muestrea el color REAL de la tinta del texto comparando el canvas completo (con texto)
- * contra el canvas de fondo limpio (sin texto). ¡Diferencia exacta pixel a pixel!
- */
+function multiplyMatrices(m1: number[], m2: number[]): number[] {
+  return [
+    m1[0] * m2[0] + m1[2] * m2[1],
+    m1[1] * m2[0] + m1[3] * m2[1],
+    m1[0] * m2[2] + m1[2] * m2[3],
+    m1[1] * m2[2] + m1[3] * m2[3],
+    m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
+    m1[1] * m2[4] + m1[3] * m2[5] + m1[5],
+  ];
+}
+
+function applyMatrixToPoint(m: number[], x: number, y: number): [number, number] {
+  return [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+}
+
 function sampleTextInkColorExact(
   fullCtx: CanvasRenderingContext2D,
   bgCtx: CanvasRenderingContext2D | null,
@@ -192,7 +248,6 @@ function sampleTextInkColorExact(
       }
     }
   } else {
-    // Fallback para escaneos sin capa de fondo separada
     const bgR = fullData[0];
     const bgG = fullData[1];
     const bgB = fullData[2];
@@ -207,7 +262,6 @@ function sampleTextInkColorExact(
 
   if (candidates.length === 0) return '111827';
 
-  // Top 20% de píxeles más contrastantes (centro sólido del trazo del glifo, sin antialiasing)
   candidates.sort((a, b) => b.dist - a.dist);
   const topCount = Math.max(1, Math.floor(candidates.length * 0.2));
   let sumR = 0;
@@ -221,64 +275,6 @@ function sampleTextInkColorExact(
   return rgbToHex(sumR / topCount, sumG / topCount, sumB / topCount);
 }
 
-/**
- * Para páginas 100% escaneadas (sin texto vectorial), borra una caja de texto OCR rellenando con
- * el color mediano de los píxeles de fondo alrededor (evita por completo rayas o estiramientos).
- */
-function fillOcrRectWithMedianBorderColor(
-  ctx: CanvasRenderingContext2D,
-  canvasW: number,
-  canvasH: number,
-  x0: number,
-  y0: number,
-  w: number,
-  h: number
-): void {
-  const rx0 = Math.max(0, Math.floor(x0));
-  const ry0 = Math.max(0, Math.floor(y0));
-  const rx1 = Math.min(canvasW - 1, Math.ceil(x0 + w));
-  const ry1 = Math.min(canvasH - 1, Math.ceil(y0 + h));
-  const rw = rx1 - rx0;
-  const rh = ry1 - ry0;
-  if (rw <= 0 || rh <= 0) return;
-
-  const rs: number[] = [];
-  const gs: number[] = [];
-  const bs: number[] = [];
-
-  const pushSample = (px: number, py: number) => {
-    const d = ctx.getImageData(
-      Math.max(0, Math.min(canvasW - 1, px)),
-      Math.max(0, Math.min(canvasH - 1, py)),
-      1,
-      1
-    ).data;
-    rs.push(d[0]);
-    gs.push(d[1]);
-    bs.push(d[2]);
-  };
-
-  for (let i = 0; i <= 8; i++) {
-    const t = i / 8;
-    const x = Math.round(rx0 + rw * t);
-    pushSample(x, ry0 - 3);
-    pushSample(x, ry1 + 3);
-  }
-  pushSample(rx0 - 3, Math.round((ry0 + ry1) / 2));
-  pushSample(rx1 + 3, Math.round((ry0 + ry1) / 2));
-
-  rs.sort((a, b) => a - b);
-  gs.sort((a, b) => a - b);
-  bs.sort((a, b) => a - b);
-  const mid = Math.floor(rs.length / 2);
-
-  ctx.fillStyle = `rgb(${rs[mid]},${gs[mid]},${bs[mid]})`;
-  ctx.fillRect(rx0, ry0, rw, rh);
-}
-
-/**
- * Encuentra el rectángulo exacto de píxeles no transparentes (alpha > 8) en un canvas transparente.
- */
 function findAlphaBoundingBox(
   canvas: HTMLCanvasElement
 ): { x: number; y: number; w: number; h: number } | null {
@@ -309,25 +305,252 @@ function findAlphaBoundingBox(
 }
 
 /**
- * Comprueba si un canvas tiene contenido visible real (píxeles no blancos).
+ * Clasifica un path `DrawOPS` de PDF.js en forma geométrica nativa editable (`rect`, `roundRect`, `ellipse`, `line`)
+ * o `'custom'` si es una forma vectorial personalizada (pétalo, icono, flecha, ilustración).
  */
-function canvasHasVisibleDesign(canvas: HTMLCanvasElement): boolean {
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) return false;
-  const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-  const step = Math.max(4, Math.floor((canvas.width * canvas.height) / 14000)) * 4;
-  let nonWhite = 0;
-  let total = 0;
-  for (let i = 0; i < data.length; i += step) {
-    total++;
-    if (data[i] < 245 || data[i + 1] < 245 || data[i + 2] < 245) nonWhite++;
+function classifyDrawOpsPath(
+  drawData: ArrayLike<number> | undefined,
+  ctm: number[],
+  hasFill: boolean,
+  hasStroke: boolean
+): {
+  kind: 'rect' | 'roundRect' | 'ellipse' | 'line' | 'custom';
+  lineFlipH?: boolean;
+  lineFlipV?: boolean;
+  rectRadiusRatio?: number;
+} {
+  if (!drawData || drawData.length < 3) return { kind: 'custom' };
+
+  let moves = 0;
+  let lines = 0;
+  let curves = 0;
+  let quads = 0;
+  const linePts: Array<[number, number]> = [];
+  const curveEndPts: Array<[number, number]> = [];
+  let curX = 0;
+  let curY = 0;
+
+  for (let i = 0; i < drawData.length; ) {
+    const cmd = drawData[i++];
+    if (cmd === 0) {
+      // moveTo
+      moves++;
+      curX = drawData[i++];
+      curY = drawData[i++];
+      linePts.push(applyMatrixToPoint(ctm, curX, curY));
+    } else if (cmd === 1) {
+      // lineTo
+      lines++;
+      curX = drawData[i++];
+      curY = drawData[i++];
+      linePts.push(applyMatrixToPoint(ctm, curX, curY));
+    } else if (cmd === 2) {
+      // curveTo (6 args)
+      curves++;
+      i += 4;
+      curX = drawData[i++];
+      curY = drawData[i++];
+      curveEndPts.push(applyMatrixToPoint(ctm, curX, curY));
+    } else if (cmd === 3) {
+      // quadraticCurveTo (4 args)
+      quads++;
+      i += 2;
+      curX = drawData[i++];
+      curY = drawData[i++];
+      curveEndPts.push(applyMatrixToPoint(ctm, curX, curY));
+    } else if (cmd === 4) {
+      // closePath
+    } else {
+      return { kind: 'custom' };
+    }
   }
-  return total > 0 && nonWhite / total > 0.002;
+
+  if (moves !== 1 || quads > 0) return { kind: 'custom' };
+
+  // 1) Línea recta simple (ej. separador central vertical/horizontal)
+  if (lines === 1 && curves === 0 && hasStroke && !hasFill && linePts.length === 2) {
+    const [p0, p1] = linePts;
+    return {
+      kind: 'line',
+      lineFlipH: p1[0] < p0[0],
+      lineFlipV: p1[1] < p0[1],
+    };
+  }
+
+  // 2) Rectángulo puro ortogonal (3 o 4 segmentos lineTo sin curvas)
+  if (curves === 0 && (lines === 3 || lines === 4)) {
+    const pts = linePts.slice(0, 4);
+    if (pts.length >= 4) {
+      const xs = pts.map((p) => p[0]);
+      const ys = pts.map((p) => p[1]);
+      const minX = Math.min(...xs);
+      const maxX = Math.max(...xs);
+      const minY = Math.min(...ys);
+      const maxY = Math.max(...ys);
+      const tolX = Math.max(1.5, (maxX - minX) * 0.015);
+      const tolY = Math.max(1.5, (maxY - minY) * 0.015);
+      const allOnCorners = pts.every(
+        ([px, py]) =>
+          (Math.abs(px - minX) <= tolX || Math.abs(px - maxX) <= tolX) &&
+          (Math.abs(py - minY) <= tolY || Math.abs(py - maxY) <= tolY)
+      );
+      if (allOnCorners) return { kind: 'rect' };
+    }
+  }
+
+  // 3) Rectángulo con esquinas redondeadas (3-5 lineTo + 4 curveTo en esquinas simétricas)
+  if (curves === 4 && lines >= 3 && lines <= 5) {
+    const allPts = [...linePts, ...curveEndPts];
+    const xs = allPts.map((p) => p[0]);
+    const ys = allPts.map((p) => p[1]);
+    const w = Math.max(...xs) - Math.min(...xs);
+    const h = Math.max(...ys) - Math.min(...ys);
+    if (w > 20 && h > 20) {
+      // Estimar radio de esquina comparando la primera línea recta contra el lado del bbox
+      const segLengths: number[] = [];
+      for (let k = 1; k < linePts.length; k++) {
+        const dx = Math.abs(linePts[k][0] - linePts[k - 1][0]);
+        const dy = Math.abs(linePts[k][1] - linePts[k - 1][1]);
+        if (dx < 2 || dy < 2) {
+          segLengths.push(Math.max(dx, dy));
+        }
+      }
+      if (segLengths.length >= 2) {
+        const minSide = Math.min(w, h);
+        const maxSeg = Math.max(...segLengths);
+        const estRadius = Math.max(0.02, Math.min(0.25, ((Math.max(w, h) - maxSeg) / 2) / minSide));
+        return { kind: 'roundRect', rectRadiusRatio: estRadius };
+      }
+    }
+  }
+
+  // 4) Elipse / Círculo (4 curvas Bézier cerradas sin líneas rectas)
+  if (curves === 4 && lines === 0) {
+    return { kind: 'ellipse' };
+  }
+
+  return { kind: 'custom' };
+}
+
+interface VectorOpRecord {
+  opIdx: number;
+  x: number; // 0..1
+  y: number; // 0..1
+  width: number; // 0..1
+  height: number; // 0..1
+  shapeKind: 'rect' | 'roundRect' | 'ellipse' | 'line' | 'custom';
+  fillHex?: string;
+  strokeHex?: string;
+  strokeWidthPt: number;
+  hasFill: boolean;
+  hasStroke: boolean;
+  inClip: boolean;
+  lineFlipH?: boolean;
+  lineFlipV?: boolean;
+  rectRadiusRatio?: number;
 }
 
 /**
- * Respaldo OCR silencioso cuando una página PDF es un escaneo o imagen sin texto seleccionable.
+ * Agrupa paths vectoriales personalizados (`custom`) que se tocan o solapan en el mismo objeto gráfico
+ * (ej. un logo vectorial de 40 trazos = 1 objeto movible, mientras pétalos separados quedan separados).
  */
+function clusterCustomVectorOps(ops: VectorOpRecord[]): VectorOpRecord[][] {
+  if (ops.length === 0) return [];
+
+  const n = ops.length;
+  const parent = Array.from({ length: n }, (_, i) => i);
+  const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+  const union = (a: number, b: number) => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent[ra] = rb;
+  };
+
+  for (let i = 0; i < n; i++) {
+    const a = ops[i];
+    const areaA = a.width * a.height;
+    for (let j = i + 1; j < n; j++) {
+      const b = ops[j];
+      const areaB = b.width * b.height;
+
+      const ox = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
+      const oy = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
+
+      if (ox > 0 && oy > 0) {
+        const inter = ox * oy;
+        const minArea = Math.min(areaA, areaB);
+        // Agrupar si uno está mayormente dentro de otro o si se solapan fuertemente (misma ilustración/icono)
+        if (minArea > 0 && inter / minArea > 0.25) {
+          union(i, j);
+        }
+      } else {
+        // Si ambos son micro-trazos (< 2.5% de ancho y alto) muy pegados (< 0.8%), unirlos (partes de un mismo icono)
+        const bothTiny = a.width < 0.04 && a.height < 0.04 && b.width < 0.04 && b.height < 0.04;
+        if (bothTiny && ox > -0.008 && oy > -0.008) {
+          union(i, j);
+        }
+      }
+    }
+  }
+
+  const map = new Map<number, VectorOpRecord[]>();
+  for (let i = 0; i < n; i++) {
+    const root = find(i);
+    const list = map.get(root);
+    if (list) list.push(ops[i]);
+    else map.set(root, [ops[i]]);
+  }
+
+  return Array.from(map.values()).sort((a, b) => a[0].opIdx - b[0].opIdx);
+}
+
+function fillOcrRectWithMedianBorderColor(
+  ctx: CanvasRenderingContext2D,
+  canvasW: number,
+  canvasH: number,
+  x0: number,
+  y0: number,
+  w: number,
+  h: number
+): void {
+  const rx0 = Math.max(0, Math.floor(x0));
+  const ry0 = Math.max(0, Math.floor(y0));
+  const rx1 = Math.min(canvasW - 1, Math.ceil(x0 + w));
+  const ry1 = Math.min(canvasH - 1, Math.ceil(y0 + h));
+  const rw = rx1 - rx0;
+  const rh = ry1 - ry0;
+  if (rw <= 0 || rh <= 0) return;
+
+  const rs: number[] = [];
+  const gs: number[] = [];
+  const bs: number[] = [];
+  const pushSample = (px: number, py: number) => {
+    const d = ctx.getImageData(
+      Math.max(0, Math.min(canvasW - 1, px)),
+      Math.max(0, Math.min(canvasH - 1, py)),
+      1,
+      1
+    ).data;
+    rs.push(d[0]);
+    gs.push(d[1]);
+    bs.push(d[2]);
+  };
+  for (let i = 0; i <= 8; i++) {
+    const t = i / 8;
+    const x = Math.round(rx0 + rw * t);
+    pushSample(x, ry0 - 3);
+    pushSample(x, ry1 + 3);
+  }
+  pushSample(rx0 - 3, Math.round((ry0 + ry1) / 2));
+  pushSample(rx1 + 3, Math.round((ry0 + ry1) / 2));
+  rs.sort((a, b) => a - b);
+  gs.sort((a, b) => a - b);
+  bs.sort((a, b) => a - b);
+  const mid = Math.floor(rs.length / 2);
+  ctx.fillStyle = `rgb(${rs[mid]},${gs[mid]},${bs[mid]})`;
+  ctx.fillRect(rx0, ry0, rw, rh);
+}
+
 async function runSilentOcrForPage(
   fullCanvas: HTMLCanvasElement,
   pageHeightPt: number
@@ -338,7 +561,6 @@ async function runSilentOcrForPage(
     corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@7.0.0',
     langPath: 'https://tessdata.projectnaptha.com/4.0.0_fast',
   });
-
   const ctx = fullCanvas.getContext('2d', { willReadFrequently: true });
 
   try {
@@ -359,7 +581,6 @@ async function runSilentOcrForPage(
             const colorHex = ctx
               ? sampleTextInkColorExact(ctx, null, fullCanvas.width, fullCanvas.height, x, y, width, height)
               : '111827';
-
             lines.push({
               text,
               x,
@@ -383,10 +604,6 @@ async function runSilentOcrForPage(
   }
 }
 
-/**
- * Agrupa líneas contiguas de la misma columna, orientación y estilo en párrafos coherentes
- * detectando automáticamente la alineación real (izquierda, centrado o derecha).
- */
 function groupLinesIntoParagraphs(lines: RichTextLine[]): RichTextParagraph[] {
   if (lines.length === 0) return [];
 
@@ -482,11 +699,14 @@ function groupLinesIntoParagraphs(lines: RichTextLine[]): RichTextParagraph[] {
 }
 
 /**
- * Analizador profesional de página PDF usando el filtrado nativo de operadores de PDF.js 6 (`operationsFilter`):
- * - CERO inpainting borroso sobre texto vectorial: PDF.js renderiza el fondo omitiendo directamente el texto.
- * - CERO desplazamientos ni recortes rotos de imágenes: cada imagen embebida se renderiza aislada sobre
- *   un lienzo transparente con su propio FormXObject y clip path reales (círculos, recortes, sombras),
- *   y luego se omite exactamente esa operación del fondo.
+ * Descompositor profesional de objetos PDF (estilo SolidFramework PptxFlt / DOCXFlt):
+ * NO convierte la página en una gran imagen plana.
+ * Separa cada elemento del PDF en su propio objeto independiente y editable:
+ * 1) Color de fondo nativo (`pageBackgroundHex`)
+ * 2) Formas vectoriales nativas editables (`rect`, `roundRect`, `ellipse`, `line`)
+ * 3) Objetos vectoriales complejos individuales (pétalos, adornos, logos) recortados con transparencia
+ * 4) Imágenes raster individuales recortadas con su máscara/clip real
+ * 5) Cuadros de texto nativos editables con fuente, tamaño, color, alineación y rotación exactos
  */
 export async function analyzePdfPage(
   page: PDFPageProxy,
@@ -501,7 +721,6 @@ export async function analyzePdfPage(
   const isLandscape = widthPt > heightPt;
   const renderScale = 2.0;
 
-  // Operadores que dibujan texto vectorial
   const TEXT_DRAW_OPS = new Set<number>([
     OPS.showText,
     OPS.showSpacedText,
@@ -509,7 +728,6 @@ export async function analyzePdfPage(
     OPS.nextLineSetSpacingShowText,
   ]);
 
-  // Operadores que pintan imágenes raster
   const IMAGE_DRAW_OPS = new Set<number>([
     OPS.paintImageXObject,
     OPS.paintInlineImageXObject,
@@ -517,16 +735,27 @@ export async function analyzePdfPage(
     OPS.paintInlineImageXObjectGroup,
   ]);
 
-  // Operadores que pintan formas vectoriales (para suprimirlos al aislar una imagen individual)
-  const VECTOR_PAINT_OPS = new Set<number>([
-    OPS.stroke,
-    OPS.closeStroke,
+  const FILL_OPS = new Set<number>([
     OPS.fill,
     OPS.eoFill,
     OPS.fillStroke,
     OPS.eoFillStroke,
     OPS.closeFillStroke,
     OPS.closeEOFillStroke,
+  ]);
+
+  const STROKE_OPS = new Set<number>([
+    OPS.stroke,
+    OPS.closeStroke,
+    OPS.fillStroke,
+    OPS.eoFillStroke,
+    OPS.closeFillStroke,
+    OPS.closeEOFillStroke,
+  ]);
+
+  const ALL_VECTOR_PAINT_OPS = new Set<number>([
+    ...FILL_OPS,
+    ...STROKE_OPS,
     OPS.shadingFill,
     OPS.rawFillPath,
     OPS.paintImageMaskXObject,
@@ -535,114 +764,341 @@ export async function analyzePdfPage(
     OPS.paintSolidColorImageMask,
   ]);
 
-  // 1) Obtener lista de operadores y renderizar página completa (para color exacto de tinta / fallback OCR)
-  const [opList, fullCanvas, textContent] = await Promise.all([
+  // 1) Obtener operatorList, textContent y dos renders de referencia (completo y sin texto para color exacto de tinta)
+  const [opList, textContent, fullCanvas, noTextCanvas] = await Promise.all([
     page.getOperatorList(),
-    renderPageFiltered(page, renderScale, { transparent: false }),
     page.getTextContent(),
+    renderPageFiltered(page, renderScale, { transparent: false }),
+    renderPageFiltered(page, renderScale, {
+      transparent: false,
+      operationsFilter: (i, list) => !TEXT_DRAW_OPS.has(list.fnArray[i]),
+    }),
   ]);
   const fullCtx = fullCanvas.getContext('2d', { willReadFrequently: true });
+  const noTextCtx = noTextCanvas.getContext('2d', { willReadFrequently: true });
 
-  // 2) Aislar cada imagen embebida con su máscara/clip y FormXObject EXACTOS usando `operationsFilter`
-  const imageOpIndices: number[] = [];
-  for (let i = 0; i < opList.fnArray.length; i++) {
-    if (IMAGE_DRAW_OPS.has(opList.fnArray[i])) {
-      imageOpIndices.push(i);
-    }
+  // 2) Recorrer opList una vez en memoria para catalogar formas vectoriales, colores, clips e imágenes
+  interface GState {
+    ctm: number[];
+    fillHex?: string;
+    strokeHex?: string;
+    lineWidth: number;
+    hasClip: boolean;
   }
 
-  const images: SceneImageObject[] = [];
-  const extractedImageOpIndices = new Set<number>();
+  const stack: GState[] = [];
+  let state: GState = {
+    ctm: [...vp1.transform],
+    fillHex: '000000',
+    strokeHex: '000000',
+    lineWidth: 1,
+    hasClip: false,
+  };
 
-  // Solo extraemos imágenes individuales cuando hay un número razonable (evita cientos de micro-tiles de textura)
-  if (imageOpIndices.length > 0 && imageOpIndices.length <= 16) {
-    for (let k = 0; k < imageOpIndices.length; k++) {
-      const targetIdx = imageOpIndices[k];
+  let pageBackgroundHex = 'FFFFFF';
+  let foundPageBg = false;
+  const vectorOps: VectorOpRecord[] = [];
+  const imageOpIndices: number[] = [];
 
-      const isolatedCanvas = await renderPageFiltered(page, renderScale, {
-        transparent: true,
-        operationsFilter: (i, list) => {
-          const fn = list.fnArray[i];
-          if (TEXT_DRAW_OPS.has(fn)) return false;
-          if (VECTOR_PAINT_OPS.has(fn)) return false;
-          if (IMAGE_DRAW_OPS.has(fn)) return i === targetIdx;
-          if (fn === OPS.constructPath) {
-            const pathOp = (list.argsArray[i] as unknown[] | undefined)?.[0];
-            const nextFn = list.fnArray[i + 1];
-            // Solo ejecutar constructPath si define un clip path (máscara circular, recorte, etc.)
-            return (
-              pathOp === OPS.clip ||
-              pathOp === OPS.eoClip ||
-              pathOp === OPS.endPath ||
-              nextFn === OPS.clip ||
-              nextFn === OPS.eoClip
-            );
-          }
-          return true;
-        },
+  for (let i = 0; i < opList.fnArray.length; i++) {
+    const fn = opList.fnArray[i];
+    const args = opList.argsArray[i] as unknown[] | undefined;
+
+    if (fn === OPS.save) {
+      stack.push({ ...state, ctm: [...state.ctm] });
+    } else if (fn === OPS.restore) {
+      state = stack.pop() || {
+        ctm: [...vp1.transform],
+        fillHex: '000000',
+        strokeHex: '000000',
+        lineWidth: 1,
+        hasClip: false,
+      };
+    } else if (fn === OPS.transform && Array.isArray(args) && args.length >= 6) {
+      state.ctm = multiplyMatrices(state.ctm, args as number[]);
+    } else if (fn === OPS.paintFormXObjectBegin) {
+      stack.push({ ...state, ctm: [...state.ctm] });
+      const mat = args?.[0];
+      if (Array.isArray(mat) && mat.length >= 6) {
+        state.ctm = multiplyMatrices(state.ctm, mat as number[]);
+      }
+    } else if (fn === OPS.paintFormXObjectEnd) {
+      state = stack.pop() || state;
+    } else if (fn === OPS.setFillRGBColor || fn === OPS.setFillGray || fn === OPS.setFillCMYKColor) {
+      state.fillHex = parseColorArgToHex(args?.length === 1 ? args[0] : args);
+    } else if (fn === OPS.setFillTransparent) {
+      state.fillHex = undefined;
+    } else if (fn === OPS.setStrokeRGBColor || fn === OPS.setStrokeGray || fn === OPS.setStrokeCMYKColor) {
+      state.strokeHex = parseColorArgToHex(args?.length === 1 ? args[0] : args);
+    } else if (fn === OPS.setStrokeTransparent) {
+      state.strokeHex = undefined;
+    } else if (fn === OPS.setLineWidth && typeof args?.[0] === 'number') {
+      state.lineWidth = args[0];
+    } else if (fn === OPS.clip || fn === OPS.eoClip) {
+      state.hasClip = true;
+    } else if (IMAGE_DRAW_OPS.has(fn)) {
+      imageOpIndices.push(i);
+    } else if (fn === OPS.shadingFill) {
+      // Sombreados / degradados
+      vectorOps.push({
+        opIdx: i,
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 1,
+        shapeKind: 'custom',
+        strokeWidthPt: 0,
+        hasFill: true,
+        hasStroke: false,
+        inClip: state.hasClip,
       });
+    } else if (fn === OPS.constructPath && Array.isArray(args)) {
+      const pathOp = args[0] as number;
+      if (pathOp === OPS.clip || pathOp === OPS.eoClip) {
+        state.hasClip = true;
+        continue;
+      }
+      if (pathOp === OPS.endPath) {
+        const nextFn = opList.fnArray[i + 1];
+        if (nextFn === OPS.clip || nextFn === OPS.eoClip) state.hasClip = true;
+        continue;
+      }
 
-      const bbox = findAlphaBoundingBox(isolatedCanvas);
-      if (!bbox) continue;
+      const hasFill = FILL_OPS.has(pathOp);
+      const hasStroke = STROKE_OPS.has(pathOp);
+      if (!hasFill && !hasStroke) continue;
 
-      const normX = bbox.x / isolatedCanvas.width;
-      const normY = bbox.y / isolatedCanvas.height;
-      const normW = bbox.w / isolatedCanvas.width;
-      const normH = bbox.h / isolatedCanvas.height;
+      const dataArr = (args[1] as Array<ArrayLike<number>> | undefined)?.[0];
+      const minMax = args[2] as number[] | undefined;
+      if (!minMax || minMax.length < 4) continue;
 
-      // Ignorar micro-artefactos (< 2.5%) y fondos que cubren toda la página (> 88% ambos ejes)
-      if (normW < 0.025 || normH < 0.025) continue;
-      if (normW > 0.88 && normH > 0.88) continue;
+      const c1 = applyMatrixToPoint(state.ctm, minMax[0], minMax[1]);
+      const c2 = applyMatrixToPoint(state.ctm, minMax[2], minMax[1]);
+      const c3 = applyMatrixToPoint(state.ctm, minMax[0], minMax[3]);
+      const c4 = applyMatrixToPoint(state.ctm, minMax[2], minMax[3]);
+      const minX = Math.min(c1[0], c2[0], c3[0], c4[0]);
+      const maxX = Math.max(c1[0], c2[0], c3[0], c4[0]);
+      const minY = Math.min(c1[1], c2[1], c3[1], c4[1]);
+      const maxY = Math.max(c1[1], c2[1], c3[1], c4[1]);
 
-      // Recortar exactamente al bounding box real de píxeles no transparentes
-      const cropCanvas = document.createElement('canvas');
-      cropCanvas.width = bbox.w;
-      cropCanvas.height = bbox.h;
-      const cropCtx = cropCanvas.getContext('2d');
-      if (!cropCtx) continue;
-      cropCtx.drawImage(
-        isolatedCanvas,
-        bbox.x,
-        bbox.y,
-        bbox.w,
-        bbox.h,
-        0,
-        0,
-        bbox.w,
-        bbox.h
-      );
+      const rawNormX = minX / vp1.width;
+      const rawNormY = minY / vp1.height;
+      const rawNormW = (maxX - minX) / vp1.width;
+      const rawNormH = (maxY - minY) / vp1.height;
 
-      const blob = await new Promise<Blob | null>((resolve) => cropCanvas.toBlob(resolve, 'image/png'));
-      if (!blob) continue;
+      const normX = Math.max(0, Math.min(0.999, rawNormX));
+      const normY = Math.max(0, Math.min(0.999, rawNormY));
+      const normW = Math.min(1 - normX, Math.max(0.001, (Math.min(vp1.width, maxX) - Math.max(0, minX)) / vp1.width));
+      const normH = Math.min(1 - normY, Math.max(0.001, (Math.min(vp1.height, maxY) - Math.max(0, minY)) / vp1.height));
 
-      images.push({
-        id: `img-${pageNumber}-${k}`,
-        dataUrl: cropCanvas.toDataURL('image/png'),
-        pngBytes: new Uint8Array(await blob.arrayBuffer()),
+      if (normW < 0.001 && normH < 0.001) continue;
+
+      const classified = classifyDrawOpsPath(dataArr, state.ctm, hasFill, hasStroke);
+      const ctmScale = Math.hypot(state.ctm[0], state.ctm[1]) || 1;
+      const strokeWidthPt = Math.max(0.5, Math.round(state.lineWidth * ctmScale * 10) / 10);
+
+      // Si es el rectángulo de fondo de toda la página (cubre >= 93% de ancho y alto), asignarlo como fondo nativo
+      if (
+        !foundPageBg &&
+        vectorOps.length <= 2 &&
+        classified.kind === 'rect' &&
+        hasFill &&
+        state.fillHex &&
+        normW >= 0.93 &&
+        normH >= 0.93
+      ) {
+        pageBackgroundHex = state.fillHex;
+        foundPageBg = true;
+        continue;
+      }
+
+      // Si el path se sale mucho del borde de la diapositiva o está bajo un clip no trivial, mejor renderizarlo como gráfico recortado
+      const overflowsPage =
+        rawNormX < -0.02 || rawNormY < -0.02 || rawNormX + rawNormW > 1.02 || rawNormY + rawNormH > 1.02;
+      const finalKind = overflowsPage ? 'custom' : classified.kind;
+
+      vectorOps.push({
+        opIdx: i,
         x: normX,
         y: normY,
         width: normW,
         height: normH,
-        pixelWidth: bbox.w,
-        pixelHeight: bbox.h,
+        shapeKind: finalKind,
+        fillHex: hasFill ? state.fillHex : undefined,
+        strokeHex: hasStroke ? state.strokeHex : undefined,
+        strokeWidthPt,
+        hasFill,
+        hasStroke,
+        inClip: state.hasClip,
+        lineFlipH: classified.lineFlipH,
+        lineFlipV: classified.lineFlipV,
+        rectRadiusRatio: classified.rectRadiusRatio,
       });
-      extractedImageOpIndices.add(targetIdx);
     }
   }
 
-  // 3) Renderizar la CAPA DE FONDO / DISEÑO 100% CRISTALINA SIN TEXTO NI IMÁGENES EXTRAÍDAS
-  const bgCanvas = await renderPageFiltered(page, renderScale, {
-    transparent: false,
-    operationsFilter: (i, list) => {
-      const fn = list.fnArray[i];
-      if (TEXT_DRAW_OPS.has(fn)) return false;
-      if (extractedImageOpIndices.has(i)) return false;
-      return true;
-    },
-  });
-  const bgCtx = bgCanvas.getContext('2d', { willReadFrequently: true });
+  // 3) Construir la lista de elementos visuales independientes (formas nativas + grupos vectoriales + imágenes)
+  const elements: SceneGraphicElement[] = [];
 
-  // 4) Extraer todos los textos vectoriales con posición, fuente, rotación y COLOR REAL exacto (full vs bg)
+  // 3A) Formas nativas puras (rect, roundRect, ellipse, line) → objetos editables nativos sin PNG
+  const customVectorOps: VectorOpRecord[] = [];
+  for (const v of vectorOps) {
+    const isTinyNoise = v.shapeKind !== 'line' && v.width < 0.008 && v.height < 0.008;
+    if (isTinyNoise) continue;
+
+    if (
+      v.shapeKind !== 'custom' &&
+      (v.fillHex || v.strokeHex)
+    ) {
+      elements.push({
+        kind: 'shape',
+        id: `shp-${pageNumber}-${v.opIdx}`,
+        zOrder: v.opIdx,
+        shapeType: v.shapeKind,
+        x: v.x,
+        y: v.y,
+        width: v.width,
+        height: v.height,
+        fillHex: v.fillHex,
+        fillAlpha: 1,
+        strokeHex: v.strokeHex,
+        strokeWidthPt: v.hasStroke ? v.strokeWidthPt : 0,
+        rectRadiusRatio: v.rectRadiusRatio,
+        lineFlipH: v.lineFlipH,
+        lineFlipV: v.lineFlipV,
+      });
+    } else {
+      customVectorOps.push(v);
+    }
+  }
+
+  // 3B) Agrupar paths vectoriales personalizados (`custom`) en objetos independientes (cada pétalo/adorno/icono separado!)
+  const clusters = clusterCustomVectorOps(customVectorOps);
+
+  // Función auxiliar para renderizar un conjunto exacto de opIndices aislado sobre canvas transparente
+  const renderIsolatedOpsToGraphic = async (
+    allowedOpSet: Set<number>,
+    zOrder: number,
+    id: string,
+    allowFullPage = false
+  ): Promise<SceneGraphicElement | null> => {
+    const isolated = await renderPageFiltered(page, renderScale, {
+      transparent: true,
+      operationsFilter: (i, list) => {
+        const fn = list.fnArray[i];
+        if (TEXT_DRAW_OPS.has(fn)) return false;
+        if (IMAGE_DRAW_OPS.has(fn)) return allowedOpSet.has(i);
+        if (ALL_VECTOR_PAINT_OPS.has(fn)) return allowedOpSet.has(i);
+        if (fn === OPS.constructPath) {
+          if (allowedOpSet.has(i)) return true;
+          const pathOp = (list.argsArray[i] as unknown[] | undefined)?.[0];
+          const nextFn = list.fnArray[i + 1];
+          return (
+            pathOp === OPS.clip ||
+            pathOp === OPS.eoClip ||
+            pathOp === OPS.endPath ||
+            nextFn === OPS.clip ||
+            nextFn === OPS.eoClip
+          );
+        }
+        return true;
+      },
+    });
+
+    const bbox = findAlphaBoundingBox(isolated);
+    if (!bbox) return null;
+
+    const normX = bbox.x / isolated.width;
+    const normY = bbox.y / isolated.height;
+    const normW = bbox.w / isolated.width;
+    const normH = bbox.h / isolated.height;
+
+    if (normW < 0.01 && normH < 0.01) return null;
+    if (!allowFullPage && normW > 0.94 && normH > 0.94) return null;
+
+    const cropCanvas = document.createElement('canvas');
+    cropCanvas.width = bbox.w;
+    cropCanvas.height = bbox.h;
+    const cropCtx = cropCanvas.getContext('2d');
+    if (!cropCtx) return null;
+    cropCtx.drawImage(isolated, bbox.x, bbox.y, bbox.w, bbox.h, 0, 0, bbox.w, bbox.h);
+
+    const blob = await new Promise<Blob | null>((resolve) => cropCanvas.toBlob(resolve, 'image/png'));
+    if (!blob) return null;
+
+    return {
+      kind: 'graphic',
+      id,
+      zOrder,
+      dataUrl: cropCanvas.toDataURL('image/png'),
+      pngBytes: new Uint8Array(await blob.arrayBuffer()),
+      x: normX,
+      y: normY,
+      width: normW,
+      height: normH,
+      pixelWidth: bbox.w,
+      pixelHeight: bbox.h,
+    };
+  };
+
+  // Si hay demasiados clusters diminutos (>28), fusionamos los que están en la misma esquina/zona para no ralentizar
+  const maxClusters = 28;
+  const finalClusters =
+    clusters.length <= maxClusters
+      ? clusters
+      : [
+          ...clusters.slice(0, maxClusters - 1),
+          clusters.slice(maxClusters - 1).flat(),
+        ];
+
+  for (let c = 0; c < finalClusters.length; c++) {
+    const group = finalClusters[c];
+    const allowed = new Set(group.map((g) => g.opIdx));
+    const graphic = await renderIsolatedOpsToGraphic(
+      allowed,
+      group[0].opIdx,
+      `vec-${pageNumber}-${c}`,
+      false
+    );
+    if (graphic) elements.push(graphic);
+  }
+
+  // 3C) Imágenes raster individuales (escudo, San Francisco, fotos circulares, ejercicios) con su clip exacto
+  let fullPageRasterImageOpIdx: number | null = null;
+  const maxImages = 20;
+  for (let k = 0; k < Math.min(imageOpIndices.length, maxImages); k++) {
+    const targetIdx = imageOpIndices[k];
+    const allowed = new Set<number>([targetIdx]);
+    const graphic = await renderIsolatedOpsToGraphic(
+      allowed,
+      targetIdx,
+      `img-${pageNumber}-${k}`,
+      true
+    );
+    if (!graphic || graphic.kind !== 'graphic') continue;
+
+    // Si una única foto cubre toda la página (> 92% ambos ejes), es un escaneo o fondo fotográfico
+    if (graphic.width > 0.92 && graphic.height > 0.92) {
+      fullPageRasterImageOpIdx = targetIdx;
+      continue;
+    }
+
+    elements.push(graphic);
+  }
+
+  // Ordenar todos los elementos visuales exactamente por su orden de dibujo (zOrder) en el PDF
+  elements.sort((a, b) => a.zOrder - b.zOrder);
+
+  // Si no encontramos fondo explícito pero el borde de noTextCanvas no es blanco (ej. fondo pintado por un clip/shading), muestrear esquina
+  if (!foundPageBg && noTextCtx) {
+    const corner = noTextCtx.getImageData(2, 2, 1, 1).data;
+    const corner2 = noTextCtx.getImageData(noTextCanvas.width - 3, 2, 1, 1).data;
+    if (colorDistSq(corner[0], corner[1], corner[2], corner2[0], corner2[1], corner2[2]) < 200) {
+      pageBackgroundHex = rgbToHex(corner[0], corner[1], corner[2]);
+    }
+  }
+
+  // 4) Extraer todos los textos vectoriales con fuente mapeada, tamaño, rotación y COLOR REAL exacto
   const styles = textContent.styles || {};
 
   interface RawItem {
@@ -753,7 +1209,7 @@ export async function analyzePdfPage(
     const colorHex = fullCtx
       ? sampleTextInkColorExact(
           fullCtx,
-          bgCtx,
+          noTextCtx,
           fullCanvas.width,
           fullCanvas.height,
           minX,
@@ -778,40 +1234,50 @@ export async function analyzePdfPage(
     };
   });
 
-  // 5) Si la página es 100% escaneada (sin texto vectorial), aplicar OCR silencioso y limpiar con color mediano
+  // 5) Caso especial: página 100% escaneada (solo 1 foto de página entera y sin texto vectorial)
+  let scannedFallbackBg: AnalyzedPdfPage['scannedFallbackBg'] = null;
   if (rawLines.length === 0) {
     onStatus?.(`Reconociendo texto de la página ${pageNumber}...`);
     rawLines = await runSilentOcrForPage(fullCanvas, heightPt);
-    if (rawLines.length > 0 && bgCtx) {
+    if (fullPageRasterImageOpIdx !== null && noTextCtx) {
       for (const line of rawLines) {
         fillOcrRectWithMedianBorderColor(
-          bgCtx,
-          bgCanvas.width,
-          bgCanvas.height,
-          line.x * bgCanvas.width - 2,
-          line.y * bgCanvas.height - 2,
-          line.width * bgCanvas.width + 4,
-          line.height * bgCanvas.height + 4
+          noTextCtx,
+          noTextCanvas.width,
+          noTextCanvas.height,
+          line.x * noTextCanvas.width - 2,
+          line.y * noTextCanvas.height - 2,
+          line.width * noTextCanvas.width + 4,
+          line.height * noTextCanvas.height + 4
         );
       }
+      const bgBlob = await new Promise<Blob | null>((resolve) =>
+        noTextCanvas.toBlob(resolve, 'image/png')
+      );
+      if (bgBlob) {
+        scannedFallbackBg = {
+          dataUrl: noTextCanvas.toDataURL('image/png'),
+          pngBytes: new Uint8Array(await bgBlob.arrayBuffer()),
+          pixelWidth: noTextCanvas.width,
+          pixelHeight: noTextCanvas.height,
+        };
+      }
     }
-  }
-
-  // 6) Exportar capa de fondo/diseño limpio si contiene gráficos visibles
-  let backgroundLayer: AnalyzedPdfPage['backgroundLayer'] = null;
-  if (canvasHasVisibleDesign(bgCanvas)) {
-    const bgBlob = await new Promise<Blob | null>((resolve) => bgCanvas.toBlob(resolve, 'image/png'));
+  } else if (fullPageRasterImageOpIdx !== null && elements.length === 0) {
+    // Fondo fotográfico full-bleed con texto vectorial encima
+    const bgBlob = await new Promise<Blob | null>((resolve) =>
+      noTextCanvas.toBlob(resolve, 'image/png')
+    );
     if (bgBlob) {
-      backgroundLayer = {
-        dataUrl: bgCanvas.toDataURL('image/png'),
+      scannedFallbackBg = {
+        dataUrl: noTextCanvas.toDataURL('image/png'),
         pngBytes: new Uint8Array(await bgBlob.arrayBuffer()),
-        pixelWidth: bgCanvas.width,
-        pixelHeight: bgCanvas.height,
+        pixelWidth: noTextCanvas.width,
+        pixelHeight: noTextCanvas.height,
       };
     }
   }
 
-  // 7) Agrupar líneas en párrafos coherentes con alineación real
   const paragraphs = groupLinesIntoParagraphs(rawLines);
 
   const hasMultiColumn = paragraphs.some((p1, idx) =>
@@ -825,17 +1291,22 @@ export async function analyzePdfPage(
   );
   const hasRotatedText = paragraphs.some((p) => Math.abs(p.angleDeg) > 10);
   const hasComplexLayout =
-    Boolean(backgroundLayer) || images.length > 0 || hasMultiColumn || hasRotatedText;
+    elements.length > 0 ||
+    pageBackgroundHex !== 'FFFFFF' ||
+    Boolean(scannedFallbackBg) ||
+    hasMultiColumn ||
+    hasRotatedText;
 
   return {
     pageNumber,
     widthPt,
     heightPt,
     isLandscape,
+    pageBackgroundHex,
+    elements,
     paragraphs,
     rawLines,
-    images,
-    backgroundLayer,
+    scannedFallbackBg,
     hasComplexLayout,
   };
 }
