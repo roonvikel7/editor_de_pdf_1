@@ -1,5 +1,5 @@
 import type { PDFPageProxy } from 'pdfjs-dist';
-import { getPdfJs, renderPageToCanvas } from './pdfCore';
+import { getPdfJs } from './pdfCore';
 
 export interface RichTextLine {
   text: string;
@@ -62,6 +62,53 @@ export interface AnalyzedPdfPage {
   hasComplexLayout: boolean;
 }
 
+type OperationsFilterFn = (
+  opIndex: number,
+  operatorList: { fnArray: number[]; argsArray: unknown[] }
+) => boolean;
+
+/**
+ * Renderiza una página PDF.js con soporte nativo de `operationsFilter` y fondo transparente opcional.
+ */
+async function renderPageFiltered(
+  page: PDFPageProxy,
+  scale: number,
+  options: {
+    transparent?: boolean;
+    operationsFilter?: OperationsFilterFn;
+  } = {}
+): Promise<HTMLCanvasElement> {
+  const viewport = page.getViewport({ scale });
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.floor(viewport.width));
+  canvas.height = Math.max(1, Math.floor(viewport.height));
+
+  const ctx = canvas.getContext('2d', {
+    alpha: Boolean(options.transparent),
+    willReadFrequently: true,
+  });
+  if (!ctx) throw new Error('No se pudo crear contexto 2D para renderizar la página.');
+
+  if (options.transparent) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  } else {
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+
+  const renderParams = {
+    canvasContext: ctx,
+    canvas,
+    viewport,
+    background: options.transparent ? 'rgba(0,0,0,0)' : 'rgb(255,255,255)',
+    operationsFilter: options.operationsFilter,
+  };
+
+  // pdfjs-dist@6 soporta `operationsFilter` de forma nativa en InternalRenderTask
+  await page.render(renderParams as Parameters<PDFPageProxy['render']>[0]).promise;
+  return canvas;
+}
+
 /**
  * Equivalente web a PdfFontMapper.txt de SolidFramework:
  * Traduce nombres de fuentes embebidas PDF a fuentes estándar limpias de Office/Web.
@@ -109,11 +156,12 @@ function colorDistSq(r1: number, g1: number, b1: number, r2: number, g2: number,
 }
 
 /**
- * Muestrea el color REAL de la tinta del texto dentro de su caja comparándolo contra el color del borde exterior.
- * Funciona para texto negro, de colores o texto blanco sobre fondos oscuros/degradados.
+ * Muestrea el color REAL de la tinta del texto comparando el canvas completo (con texto)
+ * contra el canvas de fondo limpio (sin texto). ¡Diferencia exacta pixel a pixel!
  */
-function sampleTextInkColor(
-  ctx: CanvasRenderingContext2D,
+function sampleTextInkColorExact(
+  fullCtx: CanvasRenderingContext2D,
+  bgCtx: CanvasRenderingContext2D | null,
   canvasW: number,
   canvasH: number,
   normX: number,
@@ -126,56 +174,42 @@ function sampleTextInkColor(
   const w = Math.max(2, Math.min(canvasW - x0, Math.ceil(normW * canvasW)));
   const h = Math.max(2, Math.min(canvasH - y0, Math.ceil(normH * canvasH)));
 
-  // 1) Color de fondo estimado desde un marco exterior de 2px
-  const pad = 3;
-  const bx0 = Math.max(0, x0 - pad);
-  const by0 = Math.max(0, y0 - pad);
-  const bx1 = Math.min(canvasW - 1, x0 + w + pad);
-  const by1 = Math.min(canvasH - 1, y0 + h + pad);
+  const fullData = fullCtx.getImageData(x0, y0, w, h).data;
+  const bgData = bgCtx ? bgCtx.getImageData(x0, y0, w, h).data : null;
 
-  const bgSamples: Array<[number, number, number]> = [];
-  const samplePx = (px: number, py: number) => {
-    const d = ctx.getImageData(px, py, 1, 1).data;
-    bgSamples.push([d[0], d[1], d[2]]);
-  };
-  const steps = 6;
-  for (let i = 0; i <= steps; i++) {
-    const t = i / steps;
-    samplePx(Math.floor(bx0 + (bx1 - bx0) * t), by0);
-    samplePx(Math.floor(bx0 + (bx1 - bx0) * t), by1);
-  }
-  samplePx(bx0, Math.floor((by0 + by1) / 2));
-  samplePx(bx1, Math.floor((by0 + by1) / 2));
-
-  const bgR = bgSamples.reduce((s, c) => s + c[0], 0) / Math.max(1, bgSamples.length);
-  const bgG = bgSamples.reduce((s, c) => s + c[1], 0) / Math.max(1, bgSamples.length);
-  const bgB = bgSamples.reduce((s, c) => s + c[2], 0) / Math.max(1, bgSamples.length);
-
-  // 2) Buscar los píxeles dentro de la caja con mayor contraste respecto al fondo (es la tinta real)
-  const data = ctx.getImageData(x0, y0, w, h).data;
-  const stride = Math.max(1, Math.floor((w * h) / 600));
+  const stride = Math.max(1, Math.floor((w * h) / 700));
   const candidates: Array<{ r: number; g: number; b: number; dist: number }> = [];
 
-  for (let p = 0; p < w * h; p += stride) {
-    const idx = p * 4;
-    const r = data[idx];
-    const g = data[idx + 1];
-    const b = data[idx + 2];
-    const dist = colorDistSq(r, g, b, bgR, bgG, bgB);
-    if (dist > 1400) {
-      candidates.push({ r, g, b, dist });
+  if (bgData) {
+    for (let p = 0; p < w * h; p += stride) {
+      const idx = p * 4;
+      const r = fullData[idx];
+      const g = fullData[idx + 1];
+      const b = fullData[idx + 2];
+      const dist = colorDistSq(r, g, b, bgData[idx], bgData[idx + 1], bgData[idx + 2]);
+      if (dist > 900) {
+        candidates.push({ r, g, b, dist });
+      }
+    }
+  } else {
+    // Fallback para escaneos sin capa de fondo separada
+    const bgR = fullData[0];
+    const bgG = fullData[1];
+    const bgB = fullData[2];
+    for (let p = 0; p < w * h; p += stride) {
+      const idx = p * 4;
+      const dist = colorDistSq(fullData[idx], fullData[idx + 1], fullData[idx + 2], bgR, bgG, bgB);
+      if (dist > 1400) {
+        candidates.push({ r: fullData[idx], g: fullData[idx + 1], b: fullData[idx + 2], dist });
+      }
     }
   }
 
-  if (candidates.length === 0) {
-    // Si el fondo es oscuro devolvemos blanco; si es claro devolvemos casi negro
-    const bgLum = 0.299 * bgR + 0.587 * bgG + 0.114 * bgB;
-    return bgLum < 128 ? 'FFFFFF' : '111827';
-  }
+  if (candidates.length === 0) return '111827';
 
-  // Tomar el top 25% de píxeles más contrastantes (evita antialiasing grisáceo en los bordes del glifo)
+  // Top 20% de píxeles más contrastantes (centro sólido del trazo del glifo, sin antialiasing)
   candidates.sort((a, b) => b.dist - a.dist);
-  const topCount = Math.max(1, Math.floor(candidates.length * 0.25));
+  const topCount = Math.max(1, Math.floor(candidates.length * 0.2));
   let sumR = 0;
   let sumG = 0;
   let sumB = 0;
@@ -188,10 +222,10 @@ function sampleTextInkColor(
 }
 
 /**
- * Borra una región rectangular de texto de un canvas reconstruyendo suavemente el fondo real
- * (interpolación bilineal desde los 4 bordes exteriores, preservando colores sólidos y degradados).
+ * Para páginas 100% escaneadas (sin texto vectorial), borra una caja de texto OCR rellenando con
+ * el color mediano de los píxeles de fondo alrededor (evita por completo rayas o estiramientos).
  */
-function inpaintRectFromBorders(
+function fillOcrRectWithMedianBorderColor(
   ctx: CanvasRenderingContext2D,
   canvasW: number,
   canvasH: number,
@@ -208,259 +242,87 @@ function inpaintRectFromBorders(
   const rh = ry1 - ry0;
   if (rw <= 0 || rh <= 0) return;
 
-  const topY = Math.max(0, ry0 - 2);
-  const botY = Math.min(canvasH - 1, ry1 + 2);
-  const leftX = Math.max(0, rx0 - 2);
-  const rightX = Math.min(canvasW - 1, rx1 + 2);
+  const rs: number[] = [];
+  const gs: number[] = [];
+  const bs: number[] = [];
 
-  const topRow = ctx.getImageData(rx0, topY, rw, 1).data;
-  const botRow = ctx.getImageData(rx0, botY, rw, 1).data;
-  const leftCol = ctx.getImageData(leftX, ry0, 1, rh).data;
-  const rightCol = ctx.getImageData(rightX, ry0, 1, rh).data;
-
-  const patch = ctx.createImageData(rw, rh);
-  const out = patch.data;
-
-  for (let y = 0; y < rh; y++) {
-    const ty = rh > 1 ? y / (rh - 1) : 0.5;
-    const lIdx = y * 4;
-    const rIdx = y * 4;
-    const wy = 1 - Math.abs(ty - 0.5) * 2; // peso vertical en el centro
-
-    for (let x = 0; x < rw; x++) {
-      const tx = rw > 1 ? x / (rw - 1) : 0.5;
-      const tIdx = x * 4;
-      const wx = 1 - Math.abs(tx - 0.5) * 2;
-
-      // Interpolación vertical (arriba -> abajo)
-      const vR = topRow[tIdx] * (1 - ty) + botRow[tIdx] * ty;
-      const vG = topRow[tIdx + 1] * (1 - ty) + botRow[tIdx + 1] * ty;
-      const vB = topRow[tIdx + 2] * (1 - ty) + botRow[tIdx + 2] * ty;
-
-      // Interpolación horizontal (izq -> der)
-      const hR = leftCol[lIdx] * (1 - tx) + rightCol[rIdx] * tx;
-      const hG = leftCol[lIdx + 1] * (1 - tx) + rightCol[rIdx + 1] * tx;
-      const hB = leftCol[lIdx + 2] * (1 - tx) + rightCol[rIdx + 2] * tx;
-
-      // Para líneas de texto horizontales (rw > rh), arriba/abajo están mucho más cerca del centro
-      const vWeight = rw >= rh ? 0.78 + 0.12 * wx : 0.25 + 0.1 * wy;
-      const hWeight = 1 - vWeight;
-
-      const o = (y * rw + x) * 4;
-      out[o] = Math.round(vR * vWeight + hR * hWeight);
-      out[o + 1] = Math.round(vG * vWeight + hG * hWeight);
-      out[o + 2] = Math.round(vB * vWeight + hB * hWeight);
-      out[o + 3] = 255;
-    }
-  }
-
-  ctx.putImageData(patch, rx0, ry0);
-}
-
-function multiplyMatrices(m1: number[], m2: number[]): number[] {
-  return [
-    m1[0] * m2[0] + m1[2] * m2[1],
-    m1[1] * m2[0] + m1[3] * m2[1],
-    m1[0] * m2[2] + m1[2] * m2[3],
-    m1[1] * m2[2] + m1[3] * m2[3],
-    m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
-    m1[1] * m2[4] + m1[3] * m2[5] + m1[5],
-  ];
-}
-
-/**
- * Encuentra las cajas delimitadoras de imágenes embebidas (paintImageXObject / inline)
- * para recortarlas CON SU MÁSCARA REAL (círculos, esquinas redondeadas, clips) desde el canvas sin texto.
- */
-async function detectEmbeddedImageBoxes(
-  page: PDFPageProxy
-): Promise<Array<{ x: number; y: number; width: number; height: number }>> {
-  const pdfjs = await getPdfJs();
-  const OPS = pdfjs.OPS;
-  const viewport = page.getViewport({ scale: 1 });
-  const opList = await page.getOperatorList();
-
-  const rawBoxes: Array<{ x: number; y: number; width: number; height: number }> = [];
-  const stack: number[][] = [];
-  let ctm: number[] = [...viewport.transform];
-
-  for (let i = 0; i < opList.fnArray.length; i++) {
-    const fn = opList.fnArray[i];
-    const args = opList.argsArray[i];
-
-    if (fn === OPS.save) {
-      stack.push([...ctm]);
-    } else if (fn === OPS.restore) {
-      ctm = stack.pop() || [...viewport.transform];
-    } else if (fn === OPS.transform && Array.isArray(args) && args.length >= 6) {
-      ctm = multiplyMatrices(ctm, args as number[]);
-    } else if (
-      fn === OPS.paintImageXObject ||
-      fn === OPS.paintImageXObjectRepeat ||
-      fn === OPS.paintInlineImageXObject
-    ) {
-      const corners = [
-        [ctm[4], ctm[5]],
-        [ctm[0] + ctm[4], ctm[1] + ctm[5]],
-        [ctm[2] + ctm[4], ctm[3] + ctm[5]],
-        [ctm[0] + ctm[2] + ctm[4], ctm[1] + ctm[3] + ctm[5]],
-      ];
-      const minX = Math.min(...corners.map((c) => c[0]));
-      const maxX = Math.max(...corners.map((c) => c[0]));
-      const minY = Math.min(...corners.map((c) => c[1]));
-      const maxY = Math.max(...corners.map((c) => c[1]));
-
-      const normX = Math.max(0, Math.min(0.99, minX / viewport.width));
-      const normY = Math.max(0, Math.min(0.99, minY / viewport.height));
-      const normW = Math.min(1 - normX, Math.max(0.01, (maxX - minX) / viewport.width));
-      const normH = Math.min(1 - normY, Math.max(0.01, (maxY - minY) / viewport.height));
-
-      // Ignorar micro-artefactos (< 3% de tamaño) y fondos de página entera (> 90% de ambos ejes)
-      if (normW < 0.03 || normH < 0.03) continue;
-      if (normW > 0.9 && normH > 0.9) continue;
-
-      rawBoxes.push({ x: normX, y: normY, width: normW, height: normH });
-    }
-  }
-
-  // Deduplicar cajas prácticamente idénticas (frecuente cuando PDF.js pinta imagen + soft mask)
-  const deduped: Array<{ x: number; y: number; width: number; height: number }> = [];
-  for (const box of rawBoxes) {
-    const duplicate = deduped.some(
-      (d) =>
-        Math.abs(d.x - box.x) < 0.02 &&
-        Math.abs(d.y - box.y) < 0.02 &&
-        Math.abs(d.width - box.width) < 0.03 &&
-        Math.abs(d.height - box.height) < 0.03
-    );
-    if (!duplicate) deduped.push(box);
-  }
-  return deduped;
-}
-
-/**
- * Comprueba si los 4 bordes exteriores de una caja tienen un color uniforme (ej. blanco)
- * y, si es así, recorta la imagen haciendo transparente ese fondo exterior para preservar círculos/máscaras.
- */
-async function cropMaskedImageFromCanvas(
-  designCanvas: HTMLCanvasElement,
-  box: { x: number; y: number; width: number; height: number },
-  id: string
-): Promise<{ obj: SceneImageObject; isCleanUniformBg: boolean } | null> {
-  const ctx = designCanvas.getContext('2d');
-  if (!ctx) return null;
-
-  const cw = designCanvas.width;
-  const ch = designCanvas.height;
-  const px = Math.max(0, Math.floor(box.x * cw));
-  const py = Math.max(0, Math.floor(box.y * ch));
-  const pw = Math.max(12, Math.min(cw - px, Math.ceil(box.width * cw)));
-  const ph = Math.max(12, Math.min(ch - py, Math.ceil(box.height * ch)));
-
-  // Muestrear las 4 esquinas exteriores para ver si el fondo es uniforme
-  const corners = [
-    ctx.getImageData(Math.max(0, px - 2), Math.max(0, py - 2), 1, 1).data,
-    ctx.getImageData(Math.min(cw - 1, px + pw + 1), Math.max(0, py - 2), 1, 1).data,
-    ctx.getImageData(Math.max(0, px - 2), Math.min(ch - 1, py + ph + 1), 1, 1).data,
-    ctx.getImageData(Math.min(cw - 1, px + pw + 1), Math.min(ch - 1, py + ph + 1), 1, 1).data,
-  ];
-  const avgR = corners.reduce((s, c) => s + c[0], 0) / 4;
-  const avgG = corners.reduce((s, c) => s + c[1], 0) / 4;
-  const avgB = corners.reduce((s, c) => s + c[2], 0) / 4;
-  const maxCornerSpread = Math.max(
-    ...corners.map((c) => colorDistSq(c[0], c[1], c[2], avgR, avgG, avgB))
-  );
-  const isCleanUniformBg = maxCornerSpread < 600;
-
-  const cropCanvas = document.createElement('canvas');
-  cropCanvas.width = pw;
-  cropCanvas.height = ph;
-  const cropCtx = cropCanvas.getContext('2d');
-  if (!cropCtx) return null;
-  cropCtx.drawImage(designCanvas, px, py, pw, ph, 0, 0, pw, ph);
-
-  // Si el fondo circundante es uniforme (ej. blanco detrás de una foto circular),
-  // aplicar flood-fill transparente desde los bordes del recorte para conservar la forma exacta (círculo/óvalo/estrella)
-  if (isCleanUniformBg) {
-    const imgData = cropCtx.getImageData(0, 0, pw, ph);
-    const d = imgData.data;
-    const visited = new Uint8Array(pw * ph);
-    const queue = new Int32Array(pw * ph);
-    let head = 0;
-    let tail = 0;
-
-    const tryEnqueue = (x: number, y: number) => {
-      const idx = y * pw + x;
-      if (visited[idx]) return;
-      const o = idx * 4;
-      if (colorDistSq(d[o], d[o + 1], d[o + 2], avgR, avgG, avgB) <= 950) {
-        visited[idx] = 1;
-        queue[tail++] = idx;
-      }
-    };
-
-    for (let x = 0; x < pw; x++) {
-      tryEnqueue(x, 0);
-      tryEnqueue(x, ph - 1);
-    }
-    for (let y = 0; y < ph; y++) {
-      tryEnqueue(0, y);
-      tryEnqueue(pw - 1, y);
-    }
-
-    while (head < tail) {
-      const idx = queue[head++];
-      d[idx * 4 + 3] = 0; // transparente
-      const x = idx % pw;
-      const y = (idx - x) / pw;
-      if (x > 0) tryEnqueue(x - 1, y);
-      if (x < pw - 1) tryEnqueue(x + 1, y);
-      if (y > 0) tryEnqueue(x, y - 1);
-      if (y < ph - 1) tryEnqueue(x, y + 1);
-    }
-
-    cropCtx.putImageData(imgData, 0, 0);
-  }
-
-  const blob = await new Promise<Blob | null>((resolve) => cropCanvas.toBlob(resolve, 'image/png'));
-  if (!blob) return null;
-  const pngBytes = new Uint8Array(await blob.arrayBuffer());
-  const dataUrl = cropCanvas.toDataURL('image/png');
-
-  return {
-    obj: {
-      id,
-      dataUrl,
-      pngBytes,
-      x: box.x,
-      y: box.y,
-      width: box.width,
-      height: box.height,
-      pixelWidth: pw,
-      pixelHeight: ph,
-    },
-    isCleanUniformBg,
+  const pushSample = (px: number, py: number) => {
+    const d = ctx.getImageData(
+      Math.max(0, Math.min(canvasW - 1, px)),
+      Math.max(0, Math.min(canvasH - 1, py)),
+      1,
+      1
+    ).data;
+    rs.push(d[0]);
+    gs.push(d[1]);
+    bs.push(d[2]);
   };
+
+  for (let i = 0; i <= 8; i++) {
+    const t = i / 8;
+    const x = Math.round(rx0 + rw * t);
+    pushSample(x, ry0 - 3);
+    pushSample(x, ry1 + 3);
+  }
+  pushSample(rx0 - 3, Math.round((ry0 + ry1) / 2));
+  pushSample(rx1 + 3, Math.round((ry0 + ry1) / 2));
+
+  rs.sort((a, b) => a - b);
+  gs.sort((a, b) => a - b);
+  bs.sort((a, b) => a - b);
+  const mid = Math.floor(rs.length / 2);
+
+  ctx.fillStyle = `rgb(${rs[mid]},${gs[mid]},${bs[mid]})`;
+  ctx.fillRect(rx0, ry0, rw, rh);
 }
 
 /**
- * Comprueba si un canvas de diseño contiene gráficos visibles reales (no solo blanco liso).
+ * Encuentra el rectángulo exacto de píxeles no transparentes (alpha > 8) en un canvas transparente.
+ */
+function findAlphaBoundingBox(
+  canvas: HTMLCanvasElement
+): { x: number; y: number; w: number; h: number } | null {
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return null;
+  const { width, height } = canvas;
+  const data = ctx.getImageData(0, 0, width, height).data;
+
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < height; y++) {
+    const rowOff = y * width * 4;
+    for (let x = 0; x < width; x++) {
+      if (data[rowOff + x * 4 + 3] > 8) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  if (maxX < minX || maxY < minY) return null;
+  return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+}
+
+/**
+ * Comprueba si un canvas tiene contenido visible real (píxeles no blancos).
  */
 function canvasHasVisibleDesign(canvas: HTMLCanvasElement): boolean {
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) return false;
   const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-  const step = Math.max(4, Math.floor((canvas.width * canvas.height) / 12000)) * 4;
+  const step = Math.max(4, Math.floor((canvas.width * canvas.height) / 14000)) * 4;
   let nonWhite = 0;
   let total = 0;
   for (let i = 0; i < data.length; i += step) {
     total++;
-    const r = data[i];
-    const g = data[i + 1];
-    const b = data[i + 2];
-    if (r < 244 || g < 244 || b < 244) nonWhite++;
+    if (data[i] < 245 || data[i + 1] < 245 || data[i + 2] < 245) nonWhite++;
   }
-  return total > 0 && nonWhite / total > 0.004;
+  return total > 0 && nonWhite / total > 0.002;
 }
 
 /**
@@ -477,7 +339,7 @@ async function runSilentOcrForPage(
     langPath: 'https://tessdata.projectnaptha.com/4.0.0_fast',
   });
 
-  const ctx = fullCanvas.getContext('2d');
+  const ctx = fullCanvas.getContext('2d', { willReadFrequently: true });
 
   try {
     const res = await worker.recognize(fullCanvas, {}, { text: true, blocks: true });
@@ -495,7 +357,7 @@ async function runSilentOcrForPage(
             const height = Math.min(1 - y, Math.max(0.012, (b.y1 - b.y0) / fullCanvas.height));
             const fontSizePt = Math.max(8, Math.min(48, Math.round(height * pageHeightPt * 0.78)));
             const colorHex = ctx
-              ? sampleTextInkColor(ctx, fullCanvas.width, fullCanvas.height, x, y, width, height)
+              ? sampleTextInkColorExact(ctx, null, fullCanvas.width, fullCanvas.height, x, y, width, height)
               : '111827';
 
             lines.push({
@@ -538,7 +400,6 @@ function groupLinesIntoParagraphs(lines: RichTextLine[]): RichTextParagraph[] {
     const group: RichTextLine[] = [base];
     const isVert = Math.abs(Math.abs(base.angleDeg) - 90) < 18;
 
-    // Los textos verticales quedan en su propio bloque individual para preservar rotación exacta
     if (!isVert) {
       let last = base;
       for (let j = i + 1; j < lines.length; j++) {
@@ -548,20 +409,18 @@ function groupLinesIntoParagraphs(lines: RichTextLine[]): RichTextParagraph[] {
 
         const verticalGap = cand.y - (last.y + last.height);
         if (verticalGap < -last.height * 0.3) continue;
-        if (verticalGap > Math.max(last.height * 0.95, 0.022)) continue;
+        if (verticalGap > Math.max(last.height * 0.9, 0.022)) continue;
 
-        // Verificar solapamiento horizontal (misma columna, sin mezclar columnas vecinas)
         const overlapX =
           Math.min(last.x + last.width, cand.x + cand.width) - Math.max(last.x, cand.x);
         const minW = Math.min(last.width, cand.width);
         const sameCenter =
-          Math.abs(last.x + last.width / 2 - (cand.x + cand.width / 2)) < 0.035;
-        const sameLeft = Math.abs(last.x - cand.x) < 0.025;
+          Math.abs(last.x + last.width / 2 - (cand.x + cand.width / 2)) < 0.032;
+        const sameLeft = Math.abs(last.x - cand.x) < 0.022;
         const horizontallyRelated = overlapX > minW * 0.35 || sameCenter || sameLeft;
 
-        // Estilo similar (tamaño parecido y mismo color aproximado)
         const sizeRatio = cand.fontSizePt / Math.max(1, last.fontSizePt);
-        const sameSize = sizeRatio >= 0.82 && sizeRatio <= 1.22;
+        const sameSize = sizeRatio >= 0.84 && sizeRatio <= 1.2;
         const sameColor = cand.colorHex === last.colorHex;
 
         if (horizontallyRelated && sameSize && sameColor) {
@@ -582,7 +441,6 @@ function groupLinesIntoParagraphs(lines: RichTextLine[]): RichTextParagraph[] {
     const maxY = Math.max(...group.map((g) => g.y + g.height));
     const primary = group[0];
 
-    // Detectar alineación real del bloque
     let align: 'left' | 'center' | 'right' = 'left';
     if (group.length >= 2) {
       const leftSpread = Math.max(...group.map((g) => g.x)) - Math.min(...group.map((g) => g.x));
@@ -592,15 +450,14 @@ function groupLinesIntoParagraphs(lines: RichTextLine[]): RichTextParagraph[] {
       const centers = group.map((g) => g.x + g.width / 2);
       const centerSpread = Math.max(...centers) - Math.min(...centers);
 
-      if (centerSpread < leftSpread * 0.7 && centerSpread < 0.025) {
+      if (centerSpread < leftSpread * 0.65 && centerSpread < 0.022) {
         align = 'center';
-      } else if (rightSpread < leftSpread * 0.6 && rightSpread < 0.02) {
+      } else if (rightSpread < leftSpread * 0.55 && rightSpread < 0.018) {
         align = 'right';
       }
     } else {
-      // Si es una sola línea centrada respecto a la página
       const center = primary.x + primary.width / 2;
-      if (Math.abs(center - 0.5) < 0.04 && primary.width < 0.75) {
+      if (Math.abs(center - 0.5) < 0.035 && primary.width < 0.72) {
         align = 'center';
       }
     }
@@ -613,9 +470,7 @@ function groupLinesIntoParagraphs(lines: RichTextLine[]): RichTextParagraph[] {
       y: minY,
       width: Math.max(0.02, maxX - minX),
       height: Math.max(0.014, maxY - minY),
-      fontSizePt: Math.round(
-        group.reduce((s, g) => s + g.fontSizePt, 0) / group.length
-      ),
+      fontSizePt: Math.round(group.reduce((s, g) => s + g.fontSizePt, 0) / group.length),
       fontFamily: primary.fontFamily,
       bold: group.filter((g) => g.bold).length >= group.length / 2,
       italic: group.filter((g) => g.italic).length >= group.length / 2,
@@ -627,11 +482,11 @@ function groupLinesIntoParagraphs(lines: RichTextLine[]): RichTextParagraph[] {
 }
 
 /**
- * Analizador completo de página PDF (equivalente web a PdfFlt.flt + ImageTool.dll + SolidCore):
- * Separa cada página en:
- * 1) Capa de diseño gráfico limpio sin texto (fondos, formas, degradados, bordes, iconos)
- * 2) Imágenes independientes recortadas con su máscara/clip real
- * 3) Párrafos y líneas de texto enriquecidos (color real, fuente mapeada, negrita, alineación, rotación)
+ * Analizador profesional de página PDF usando el filtrado nativo de operadores de PDF.js 6 (`operationsFilter`):
+ * - CERO inpainting borroso sobre texto vectorial: PDF.js renderiza el fondo omitiendo directamente el texto.
+ * - CERO desplazamientos ni recortes rotos de imágenes: cada imagen embebida se renderiza aislada sobre
+ *   un lienzo transparente con su propio FormXObject y clip path reales (círculos, recortes, sombras),
+ *   y luego se omite exactamente esa operación del fondo.
  */
 export async function analyzePdfPage(
   page: PDFPageProxy,
@@ -639,19 +494,155 @@ export async function analyzePdfPage(
   onStatus?: (msg: string) => void
 ): Promise<AnalyzedPdfPage> {
   const pdfjs = await getPdfJs();
+  const OPS = pdfjs.OPS;
   const vp1 = page.getViewport({ scale: 1 });
   const widthPt = vp1.width;
   const heightPt = vp1.height;
   const isLandscape = widthPt > heightPt;
-
-  // 1) Renderizar la página completa a alta resolución (2.0x)
   const renderScale = 2.0;
-  const fullCanvas = document.createElement('canvas');
-  await renderPageToCanvas(page, fullCanvas, renderScale);
+
+  // Operadores que dibujan texto vectorial
+  const TEXT_DRAW_OPS = new Set<number>([
+    OPS.showText,
+    OPS.showSpacedText,
+    OPS.nextLineShowText,
+    OPS.nextLineSetSpacingShowText,
+  ]);
+
+  // Operadores que pintan imágenes raster
+  const IMAGE_DRAW_OPS = new Set<number>([
+    OPS.paintImageXObject,
+    OPS.paintInlineImageXObject,
+    OPS.paintImageXObjectRepeat,
+    OPS.paintInlineImageXObjectGroup,
+  ]);
+
+  // Operadores que pintan formas vectoriales (para suprimirlos al aislar una imagen individual)
+  const VECTOR_PAINT_OPS = new Set<number>([
+    OPS.stroke,
+    OPS.closeStroke,
+    OPS.fill,
+    OPS.eoFill,
+    OPS.fillStroke,
+    OPS.eoFillStroke,
+    OPS.closeFillStroke,
+    OPS.closeEOFillStroke,
+    OPS.shadingFill,
+    OPS.rawFillPath,
+    OPS.paintImageMaskXObject,
+    OPS.paintImageMaskXObjectGroup,
+    OPS.paintImageMaskXObjectRepeat,
+    OPS.paintSolidColorImageMask,
+  ]);
+
+  // 1) Obtener lista de operadores y renderizar página completa (para color exacto de tinta / fallback OCR)
+  const [opList, fullCanvas, textContent] = await Promise.all([
+    page.getOperatorList(),
+    renderPageFiltered(page, renderScale, { transparent: false }),
+    page.getTextContent(),
+  ]);
   const fullCtx = fullCanvas.getContext('2d', { willReadFrequently: true });
 
-  // 2) Extraer todos los elementos de texto vectorial con posición, fuente, rotación y COLOR REAL
-  const textContent = await page.getTextContent();
+  // 2) Aislar cada imagen embebida con su máscara/clip y FormXObject EXACTOS usando `operationsFilter`
+  const imageOpIndices: number[] = [];
+  for (let i = 0; i < opList.fnArray.length; i++) {
+    if (IMAGE_DRAW_OPS.has(opList.fnArray[i])) {
+      imageOpIndices.push(i);
+    }
+  }
+
+  const images: SceneImageObject[] = [];
+  const extractedImageOpIndices = new Set<number>();
+
+  // Solo extraemos imágenes individuales cuando hay un número razonable (evita cientos de micro-tiles de textura)
+  if (imageOpIndices.length > 0 && imageOpIndices.length <= 16) {
+    for (let k = 0; k < imageOpIndices.length; k++) {
+      const targetIdx = imageOpIndices[k];
+
+      const isolatedCanvas = await renderPageFiltered(page, renderScale, {
+        transparent: true,
+        operationsFilter: (i, list) => {
+          const fn = list.fnArray[i];
+          if (TEXT_DRAW_OPS.has(fn)) return false;
+          if (VECTOR_PAINT_OPS.has(fn)) return false;
+          if (IMAGE_DRAW_OPS.has(fn)) return i === targetIdx;
+          if (fn === OPS.constructPath) {
+            const pathOp = (list.argsArray[i] as unknown[] | undefined)?.[0];
+            const nextFn = list.fnArray[i + 1];
+            // Solo ejecutar constructPath si define un clip path (máscara circular, recorte, etc.)
+            return (
+              pathOp === OPS.clip ||
+              pathOp === OPS.eoClip ||
+              pathOp === OPS.endPath ||
+              nextFn === OPS.clip ||
+              nextFn === OPS.eoClip
+            );
+          }
+          return true;
+        },
+      });
+
+      const bbox = findAlphaBoundingBox(isolatedCanvas);
+      if (!bbox) continue;
+
+      const normX = bbox.x / isolatedCanvas.width;
+      const normY = bbox.y / isolatedCanvas.height;
+      const normW = bbox.w / isolatedCanvas.width;
+      const normH = bbox.h / isolatedCanvas.height;
+
+      // Ignorar micro-artefactos (< 2.5%) y fondos que cubren toda la página (> 88% ambos ejes)
+      if (normW < 0.025 || normH < 0.025) continue;
+      if (normW > 0.88 && normH > 0.88) continue;
+
+      // Recortar exactamente al bounding box real de píxeles no transparentes
+      const cropCanvas = document.createElement('canvas');
+      cropCanvas.width = bbox.w;
+      cropCanvas.height = bbox.h;
+      const cropCtx = cropCanvas.getContext('2d');
+      if (!cropCtx) continue;
+      cropCtx.drawImage(
+        isolatedCanvas,
+        bbox.x,
+        bbox.y,
+        bbox.w,
+        bbox.h,
+        0,
+        0,
+        bbox.w,
+        bbox.h
+      );
+
+      const blob = await new Promise<Blob | null>((resolve) => cropCanvas.toBlob(resolve, 'image/png'));
+      if (!blob) continue;
+
+      images.push({
+        id: `img-${pageNumber}-${k}`,
+        dataUrl: cropCanvas.toDataURL('image/png'),
+        pngBytes: new Uint8Array(await blob.arrayBuffer()),
+        x: normX,
+        y: normY,
+        width: normW,
+        height: normH,
+        pixelWidth: bbox.w,
+        pixelHeight: bbox.h,
+      });
+      extractedImageOpIndices.add(targetIdx);
+    }
+  }
+
+  // 3) Renderizar la CAPA DE FONDO / DISEÑO 100% CRISTALINA SIN TEXTO NI IMÁGENES EXTRAÍDAS
+  const bgCanvas = await renderPageFiltered(page, renderScale, {
+    transparent: false,
+    operationsFilter: (i, list) => {
+      const fn = list.fnArray[i];
+      if (TEXT_DRAW_OPS.has(fn)) return false;
+      if (extractedImageOpIndices.has(i)) return false;
+      return true;
+    },
+  });
+  const bgCtx = bgCanvas.getContext('2d', { willReadFrequently: true });
+
+  // 4) Extraer todos los textos vectoriales con posición, fuente, rotación y COLOR REAL exacto (full vs bg)
   const styles = textContent.styles || {};
 
   interface RawItem {
@@ -700,7 +691,6 @@ export async function analyzePdfPage(
     });
   }
 
-  // Agrupar fragmentos contiguos en líneas
   rawItems.sort((a, b) => {
     const dy = a.y - b.y;
     if (Math.abs(dy) > Math.min(a.height, b.height) * 0.52) return dy;
@@ -761,7 +751,16 @@ export async function analyzePdfPage(
     const hNorm = Math.max(0.012, maxY - minY);
 
     const colorHex = fullCtx
-      ? sampleTextInkColor(fullCtx, fullCanvas.width, fullCanvas.height, minX, minY, wNorm, hNorm)
+      ? sampleTextInkColorExact(
+          fullCtx,
+          bgCtx,
+          fullCanvas.width,
+          fullCanvas.height,
+          minX,
+          minY,
+          wNorm,
+          hNorm
+        )
       : '111827';
 
     return {
@@ -779,81 +778,42 @@ export async function analyzePdfPage(
     };
   });
 
-  // Si la página no tiene texto seleccionable (escaneo / curvas), aplicar OCR silencioso automático
+  // 5) Si la página es 100% escaneada (sin texto vectorial), aplicar OCR silencioso y limpiar con color mediano
   if (rawLines.length === 0) {
     onStatus?.(`Reconociendo texto de la página ${pageNumber}...`);
     rawLines = await runSilentOcrForPage(fullCanvas, heightPt);
-  }
-
-  // 3) Construir el lienzo de DISEÑO LIMPIO SIN TEXTO (designCanvas)
-  const designCanvas = document.createElement('canvas');
-  designCanvas.width = fullCanvas.width;
-  designCanvas.height = fullCanvas.height;
-  const designCtx = designCanvas.getContext('2d', { willReadFrequently: true });
-  if (designCtx) {
-    designCtx.drawImage(fullCanvas, 0, 0);
-
-    // Borrar limpiamente cada línea/ítem de texto con inpainting direccional del fondo real
-    const boxesToErase = rawItems.length > 0 ? rawItems : rawLines;
-    for (const item of boxesToErase) {
-      const padX = Math.max(3, Math.ceil(item.fontSizePt * 0.16 * renderScale));
-      const padY = Math.max(3, Math.ceil(item.fontSizePt * 0.18 * renderScale));
-      inpaintRectFromBorders(
-        designCtx,
-        designCanvas.width,
-        designCanvas.height,
-        item.x * designCanvas.width - padX,
-        item.y * designCanvas.height - padY,
-        item.width * designCanvas.width + padX * 2,
-        item.height * designCanvas.height + padY * 2
-      );
+    if (rawLines.length > 0 && bgCtx) {
+      for (const line of rawLines) {
+        fillOcrRectWithMedianBorderColor(
+          bgCtx,
+          bgCanvas.width,
+          bgCanvas.height,
+          line.x * bgCanvas.width - 2,
+          line.y * bgCanvas.height - 2,
+          line.width * bgCanvas.width + 4,
+          line.height * bgCanvas.height + 4
+        );
+      }
     }
   }
 
-  // 4) Extraer imágenes independientes CON SU MÁSCARA REAL (círculos, recortes) desde designCanvas
-  const imgBoxes = await detectEmbeddedImageBoxes(page).catch(() => []);
-  const images: SceneImageObject[] = [];
-
-  for (let i = 0; i < imgBoxes.length; i++) {
-    const box = imgBoxes[i];
-    const cropped = await cropMaskedImageFromCanvas(designCanvas, box, `img-${pageNumber}-${i}`);
-    if (!cropped) continue;
-    images.push(cropped.obj);
-
-    // Si la imagen estaba sobre fondo uniforme, limpiarla de la capa de fondo para que sea 100% movible sin sombra duplicada
-    if (cropped.isCleanUniformBg && designCtx) {
-      inpaintRectFromBorders(
-        designCtx,
-        designCanvas.width,
-        designCanvas.height,
-        box.x * designCanvas.width - 2,
-        box.y * designCanvas.height - 2,
-        box.width * designCanvas.width + 4,
-        box.height * designCanvas.height + 4
-      );
-    }
-  }
-
-  // 5) Exportar capa de diseño de fondo si contiene elementos gráficos visibles (fondos, formas, líneas, degradados)
+  // 6) Exportar capa de fondo/diseño limpio si contiene gráficos visibles
   let backgroundLayer: AnalyzedPdfPage['backgroundLayer'] = null;
-  if (canvasHasVisibleDesign(designCanvas)) {
-    const bgBlob = await new Promise<Blob | null>((resolve) =>
-      designCanvas.toBlob(resolve, 'image/png')
-    );
+  if (canvasHasVisibleDesign(bgCanvas)) {
+    const bgBlob = await new Promise<Blob | null>((resolve) => bgCanvas.toBlob(resolve, 'image/png'));
     if (bgBlob) {
       backgroundLayer = {
-        dataUrl: designCanvas.toDataURL('image/png'),
+        dataUrl: bgCanvas.toDataURL('image/png'),
         pngBytes: new Uint8Array(await bgBlob.arrayBuffer()),
-        pixelWidth: designCanvas.width,
-        pixelHeight: designCanvas.height,
+        pixelWidth: bgCanvas.width,
+        pixelHeight: bgCanvas.height,
       };
     }
   }
 
-  // 6) Agrupar líneas en párrafos coherentes con alineación real
+  // 7) Agrupar líneas en párrafos coherentes con alineación real
   const paragraphs = groupLinesIntoParagraphs(rawLines);
 
-  // Determinar si la página tiene diseño gráfico/multi-columna (para elegir layout absoluto vs flujo en Word)
   const hasMultiColumn = paragraphs.some((p1, idx) =>
     paragraphs.slice(idx + 1).some((p2) => {
       const sameVerticalBand =
