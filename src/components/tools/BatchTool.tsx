@@ -41,7 +41,7 @@ export const BatchTool: React.FC = () => {
           const res = await compressPdf(buffer, 'balanced');
           zip.file(`${clean}_comprimido.pdf`, res.bytes);
         } else if (action === 'to-docx') {
-          const res = await convertPdfToDocx(buffer, f.name, 'editable');
+          const res = await convertPdfToDocx(buffer, f.name);
           zip.file(res.filename, res.blob);
         } else if (action === 'to-txt') {
           const res = await convertPdfToTextOrHtml(buffer, f.name, 'txt');

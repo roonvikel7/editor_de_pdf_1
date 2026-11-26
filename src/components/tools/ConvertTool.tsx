@@ -45,10 +45,6 @@ export const ConvertTool: React.FC<ConvertToolProps> = ({
   // Estado PDF -> Otros
   const [pdfFile, setPdfFile] = useState<{ name: string; buffer: ArrayBuffer; size: number } | null>(null);
   const [targetFormat, setTargetFormat] = useState<OutFormat>('docx');
-  const [docxMode, setDocxMode] = useState<'editable' | 'visual'>('editable');
-  const [pptxMode, setPptxMode] = useState<'editable' | 'visual'>('editable');
-  const [autoOcr, setAutoOcr] = useState(true);
-  const [ocrLang, setOcrLang] = useState('spa');
   const [imgScale, setImgScale] = useState(2);
 
   // Estado Otros -> PDF
@@ -91,13 +87,12 @@ export const ConvertTool: React.FC<ConvertToolProps> = ({
     setResultInfo(null);
     try {
       let res: { blob: Blob; filename: string; textPreview?: string };
-      const ocrOpts = { autoOcr, ocrLang };
       if (targetFormat === 'docx') {
-        res = await convertPdfToDocx(pdfFile.buffer, pdfFile.name, docxMode, setProgress, ocrOpts);
+        res = await convertPdfToDocx(pdfFile.buffer, pdfFile.name, setProgress);
       } else if (targetFormat === 'xlsx' || targetFormat === 'csv') {
-        res = await convertPdfToExcel(pdfFile.buffer, pdfFile.name, targetFormat, setProgress, ocrOpts);
+        res = await convertPdfToExcel(pdfFile.buffer, pdfFile.name, targetFormat, setProgress);
       } else if (targetFormat === 'pptx') {
-        res = await convertPdfToPptx(pdfFile.buffer, pdfFile.name, pptxMode, setProgress, ocrOpts);
+        res = await convertPdfToPptx(pdfFile.buffer, pdfFile.name, setProgress);
       } else if (targetFormat === 'png' || targetFormat === 'jpeg' || targetFormat === 'webp') {
         res = await convertPdfToImages(
           pdfFile.buffer,
@@ -106,7 +101,7 @@ export const ConvertTool: React.FC<ConvertToolProps> = ({
           setProgress
         );
       } else {
-        res = await convertPdfToTextOrHtml(pdfFile.buffer, pdfFile.name, targetFormat, setProgress, ocrOpts);
+        res = await convertPdfToTextOrHtml(pdfFile.buffer, pdfFile.name, targetFormat, setProgress);
       }
 
       setResultInfo(res);
@@ -167,15 +162,15 @@ export const ConvertTool: React.FC<ConvertToolProps> = ({
   };
 
   const formatOptions: Array<{ id: OutFormat; label: string; sub: string; icon: React.ReactNode }> = [
-    { id: 'docx', label: 'Word (.docx)', sub: 'Documento editable', icon: <FileText className="h-4 w-4 text-blue-600" /> },
-    { id: 'xlsx', label: 'Excel (.xlsx)', sub: 'Tablas y hojas', icon: <FileSpreadsheet className="h-4 w-4 text-emerald-600" /> },
-    { id: 'pptx', label: 'PowerPoint (.pptx)', sub: 'Diapositivas', icon: <Presentation className="h-4 w-4 text-orange-500" /> },
+    { id: 'docx', label: 'Word (.docx)', sub: 'Documento Word', icon: <FileText className="h-4 w-4 text-blue-600" /> },
+    { id: 'xlsx', label: 'Excel (.xlsx)', sub: 'Hoja de cálculo', icon: <FileSpreadsheet className="h-4 w-4 text-emerald-600" /> },
+    { id: 'pptx', label: 'PowerPoint (.pptx)', sub: 'Presentación', icon: <Presentation className="h-4 w-4 text-orange-500" /> },
     { id: 'png', label: 'Imágenes PNG', sub: 'Alta nitidez', icon: <ImageIcon className="h-4 w-4 text-violet-600" /> },
     { id: 'jpeg', label: 'Imágenes JPG', sub: 'Peso ligero', icon: <ImageIcon className="h-4 w-4 text-pink-600" /> },
     { id: 'webp', label: 'Imágenes WebP', sub: 'Ultra compacto', icon: <ImageIcon className="h-4 w-4 text-cyan-600" /> },
     { id: 'csv', label: 'Tabla CSV', sub: 'Datos separados', icon: <FileSpreadsheet className="h-4 w-4 text-teal-600" /> },
-    { id: 'html', label: 'Web HTML', sub: 'Página estructurada', icon: <Code2 className="h-4 w-4 text-indigo-600" /> },
-    { id: 'txt', label: 'Texto plano', sub: 'Solo texto', icon: <AlignLeft className="h-4 w-4 text-slate-600" /> },
+    { id: 'html', label: 'Web HTML', sub: 'Página adaptable', icon: <Code2 className="h-4 w-4 text-indigo-600" /> },
+    { id: 'txt', label: 'Texto (.txt)', sub: 'Texto limpio', icon: <AlignLeft className="h-4 w-4 text-slate-600" /> },
   ];
 
   return (
@@ -183,7 +178,7 @@ export const ConvertTool: React.FC<ConvertToolProps> = ({
       <div>
         <h1 className="text-xl font-bold text-slate-900 dark:text-white">Conversor Universal PDF</h1>
         <p className="mt-1 text-xs sm:text-sm text-slate-500 dark:text-slate-400">
-          Filtros modulares tipo SolidFramework ejecutados 100% en tu navegador sin subir archivos.
+          Convierte cualquier documento preservando su diseño original, colores, gráficos e imágenes 100% en tu dispositivo.
         </p>
       </div>
 
@@ -273,11 +268,11 @@ export const ConvertTool: React.FC<ConvertToolProps> = ({
             )}
           </div>
 
-          {/* Derecha: Formato de salida y opciones */}
+          {/* Derecha: Formato de salida y botón Convertir directo */}
           <div className="lg:col-span-7 space-y-4">
             <div className="rounded-2xl border border-slate-200/90 bg-white p-4 sm:p-5 dark:border-slate-800 dark:bg-slate-900">
               <h2 className="mb-3 text-sm font-bold text-slate-800 dark:text-slate-100">
-                1. Elige el formato de salida
+                Elige el formato de salida
               </h2>
               <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                 {formatOptions.map((opt) => (
@@ -300,97 +295,6 @@ export const ConvertTool: React.FC<ConvertToolProps> = ({
                   </button>
                 ))}
               </div>
-
-              {/* Opciones específicas del formato */}
-              {targetFormat === 'docx' && (
-                <div className="mt-4 rounded-xl bg-slate-50 p-3 dark:bg-slate-800/60">
-                  <p className="mb-2 text-xs font-semibold text-slate-700 dark:text-slate-200">
-                    Modo de conversión a Word:
-                  </p>
-                  <div className="flex flex-wrap gap-2">
-                    <button
-                      onClick={() => setDocxMode('editable')}
-                      className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${
-                        docxMode === 'editable'
-                          ? 'bg-blue-600 text-white'
-                          : 'bg-white text-slate-600 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300'
-                      }`}
-                    >
-                      Texto y párrafos editables (Recomendado)
-                    </button>
-                    <button
-                      onClick={() => setDocxMode('visual')}
-                      className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${
-                        docxMode === 'visual'
-                          ? 'bg-blue-600 text-white'
-                          : 'bg-white text-slate-600 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300'
-                      }`}
-                    >
-                      Fidelidad visual exacta (páginas como imagen)
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {targetFormat === 'pptx' && (
-                <div className="mt-4 rounded-xl bg-slate-50 p-3 dark:bg-slate-800/60">
-                  <p className="mb-2 text-xs font-semibold text-slate-700 dark:text-slate-200">
-                    Modo de diapositivas PowerPoint:
-                  </p>
-                  <div className="flex flex-wrap gap-2">
-                    <button
-                      onClick={() => setPptxMode('editable')}
-                      className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${
-                        pptxMode === 'editable'
-                          ? 'bg-blue-600 text-white'
-                          : 'bg-white text-slate-600 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300'
-                      }`}
-                    >
-                      100% Editable (textos e imágenes separados · Recomendado)
-                    </button>
-                    <button
-                      onClick={() => setPptxMode('visual')}
-                      className={`rounded-lg px-3 py-1.5 text-xs font-semibold ${
-                        pptxMode === 'visual'
-                          ? 'bg-blue-600 text-white'
-                          : 'bg-white text-slate-600 border border-slate-200 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300'
-                      }`}
-                    >
-                      Solo imagen fija (fidelidad visual)
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {(targetFormat === 'docx' ||
-                targetFormat === 'pptx' ||
-                targetFormat === 'xlsx' ||
-                targetFormat === 'csv' ||
-                targetFormat === 'html' ||
-                targetFormat === 'txt') && (
-                <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-blue-100 bg-blue-50/50 px-3 py-2.5 text-xs dark:border-blue-900/40 dark:bg-blue-950/25">
-                  <label className="flex cursor-pointer items-center gap-2 font-medium text-slate-700 dark:text-slate-200">
-                    <input
-                      type="checkbox"
-                      checked={autoOcr}
-                      onChange={(e) => setAutoOcr(e.target.checked)}
-                      className="accent-blue-600"
-                    />
-                    <span>OCR automático si el PDF es escaneado (siempre texto editable)</span>
-                  </label>
-                  {autoOcr && (
-                    <select
-                      value={ocrLang}
-                      onChange={(e) => setOcrLang(e.target.value)}
-                      className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs font-semibold dark:border-slate-700 dark:bg-slate-900"
-                    >
-                      <option value="spa">Español</option>
-                      <option value="spa+eng">Español + Inglés</option>
-                      <option value="eng">Inglés</option>
-                    </select>
-                  )}
-                </div>
-              )}
 
               {(targetFormat === 'png' || targetFormat === 'jpeg' || targetFormat === 'webp') && (
                 <div className="mt-4 flex flex-wrap items-center gap-3 rounded-xl bg-slate-50 p-3 text-xs dark:bg-slate-800/60">
@@ -427,7 +331,7 @@ export const ConvertTool: React.FC<ConvertToolProps> = ({
                   </>
                 ) : (
                   <>
-                    <span>Convertir y descargar</span>
+                    <span>Convertir</span>
                     <ArrowRight className="h-4 w-4" />
                   </>
                 )}
@@ -539,7 +443,7 @@ export const ConvertTool: React.FC<ConvertToolProps> = ({
                   </>
                 ) : (
                   <>
-                    <span>Convertir a PDF y descargar</span>
+                    <span>Convertir</span>
                     <ArrowRight className="h-4 w-4" />
                   </>
                 )}
